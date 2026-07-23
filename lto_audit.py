@@ -34,8 +34,9 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
-VERSION = "1.0.1"
+VERSION = "1.3.0"
 
 BINARY_UNITS = {
     "B": 1,
@@ -43,6 +44,19 @@ BINARY_UNITS = {
     "MB": 1024 ** 2,
     "GB": 1024 ** 3,
     "TB": 1024 ** 4,
+}
+
+DECIMAL_UNITS = {
+    "B": 1,
+    "KB": 1000,
+    "MB": 1000 ** 2,
+    "GB": 1000 ** 3,
+    "TB": 1000 ** 4,
+}
+
+PDF_SIZE_UNIT_TABLES = {
+    "decimal": DECIMAL_UNITS,
+    "binary": BINARY_UNITS,
 }
 
 ENTRY_RE = re.compile(
@@ -102,6 +116,76 @@ class StorageEntry:
     norm_filename: str
     size_bytes: int
     mtime_ns: int
+
+
+@dataclass
+class StorageClassification:
+    """Final comparison result for one physical storage entry.
+
+    ``status`` is suitable for the legacy reports.  The additional facts keep
+    safety decisions explicit instead of inferring them from a path-level CSV
+    row, which may represent files from more than one storage root.
+    """
+
+    storage: StorageEntry
+    status: str
+    lto_entries: List[LtoEntry]
+    matched_lto_entries: List[LtoEntry]
+    note: str
+    verified_known_size_full_path: bool
+    lto_duplicate_kind: str
+    storage_duplicate_kind: str
+    blocking_reasons: Tuple[str, ...]
+
+
+@dataclass
+class LtoSizeTotals:
+    path_count: int = 0
+    known_size_count: int = 0
+    unknown_size_count: int = 0
+    conflicting_size_path_count: int = 0
+    additional_identical_tape_copy_count: int = 0
+    total_min_bytes: int = 0
+    total_max_bytes: int = 0
+
+
+@dataclass
+class FolderAudit:
+    source_root: str
+    top_folder_bytes: bytes
+    top_folder: str
+    norm_top_folder: str
+    classifications: List[StorageClassification]
+    blocking_reasons: List[str]
+    scan_issue_types: List[str]
+    matched_lto_totals: LtoSizeTotals
+    manifest_lto_totals: LtoSizeTotals
+    storage_norm_paths: set[str]
+    manifest_norm_paths: set[str]
+
+
+@dataclass(frozen=True)
+class PdfSizeUnitInfo:
+    mode: str
+    label: str
+    warning: str = ""
+
+
+@dataclass(frozen=True)
+class SimpleFolderEvaluation:
+    result: str
+    reason_codes: Tuple[str, ...]
+    known_size_match_count: int
+    unknown_size_path_match_count: int
+    storage_only_path_count: int
+    lto_only_path_count: int
+    size_mismatch_count: int
+    conflicting_lto_path_count: int
+    ambiguous_path_count: int
+    zero_size_file_count: int
+    scan_issue_count: int
+    invalid_encoding_count: int
+    aggregate_size_result: str
 
 
 def eprint(*args: object, **kwargs: object) -> None:
@@ -171,18 +255,24 @@ def parse_lto_path(raw_path: str) -> Tuple[str, str]:
     return tape, relative
 
 
-def size_interval(number_text: str, unit: str) -> SizeRange:
+def size_interval(number_text: str, unit: str, *, unit_mode: str = "binary") -> SizeRange:
     """Convert a rounded YoYotta value to the exact integer-byte interval.
 
-    YoYotta is configured here as binary units. If it displays 23.29 GB, any
-    integer byte count that rounds to 23.29 at the shown precision is accepted.
+    ``unit_mode`` controls whether PDF labels such as GB mean decimal SI units
+    or binary powers. Any integer byte count that rounds to the displayed value
+    at the shown precision is accepted.
     """
     try:
         value = Decimal(number_text)
     except InvalidOperation as exc:
         raise ValueError(f"Invalid size number: {number_text!r}") from exc
 
-    multiplier = BINARY_UNITS[unit]
+    try:
+        multiplier = PDF_SIZE_UNIT_TABLES[unit_mode][unit]
+    except KeyError as exc:
+        if unit_mode not in PDF_SIZE_UNIT_TABLES:
+            raise ValueError(f"Unsupported PDF size unit mode: {unit_mode!r}") from exc
+        raise ValueError(f"Unsupported PDF size unit: {unit!r}") from exc
     display = f"{number_text} {unit}"
 
     if unit == "B":
@@ -354,7 +444,9 @@ def make_lto_entry(
     )
 
 
-def parse_yoyotta_pdf(pdf_path: Path) -> Tuple[List[LtoEntry], List[dict], dict]:
+def parse_yoyotta_pdf(
+    pdf_path: Path, *, pdf_size_units: str = "decimal"
+) -> Tuple[List[LtoEntry], List[dict], dict]:
     lines = extract_pdf_lines(pdf_path)
     project = find_project(lines, pdf_path.stem)
     expected_files = find_expected_files(lines)
@@ -398,7 +490,7 @@ def parse_yoyotta_pdf(pdf_path: Path) -> Tuple[List[LtoEntry], List[dict], dict]
 
             try:
                 tape, relative_path = parse_lto_path(raw_path)
-                size = size_interval(number_text, unit)
+                size = size_interval(number_text, unit, unit_mode=pdf_size_units)
                 entry = make_lto_entry(
                     source_pdf=str(pdf_path),
                     source_page=page_no,
@@ -497,8 +589,8 @@ def parse_yoyotta_pdf(pdf_path: Path) -> Tuple[List[LtoEntry], List[dict], dict]
         try:
             tape, first_relative = parse_lto_path(raw_path)
             parent = PurePosixPath(first_relative).parent
-            first_size = size_interval(number_text, unit)
-            last_size = size_interval(last_number, last_unit)
+            first_size = size_interval(number_text, unit, unit_mode=pdf_size_units)
+            last_size = size_interval(last_number, last_unit, unit_mode=pdf_size_units)
             sequence_counter += 1
             sequence_id = f"{pdf_path.name}:p{page_no}:seq{sequence_counter}"
 
@@ -585,6 +677,29 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA temp_store=MEMORY")
     initialize_schema(connection)
+    return connection
+
+
+def connect_db_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open an existing audit database without creating or changing it."""
+    db_path = db_path.expanduser().resolve()
+    if not db_path.is_file():
+        raise FileNotFoundError(f"Audit database not found: {db_path}")
+    sidecars = [Path(str(db_path) + suffix) for suffix in ("-wal", "-shm")]
+    present_sidecars = [path for path in sidecars if path.exists()]
+    if present_sidecars:
+        raise RuntimeError(
+            "Audit database has active SQLite WAL/SHM sidecars and cannot be opened "
+            "as an immutable read-only snapshot: "
+            + ", ".join(str(path) for path in present_sidecars)
+        )
+    # immutable=1 prevents SQLite from creating WAL/SHM sidecars for this
+    # reporting-only connection. Audit databases are completed snapshots and
+    # must not be concurrently written while this command is running.
+    uri = "file:" + quote(str(db_path), safe="/") + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
     return connection
 
 
@@ -765,20 +880,40 @@ def insert_lto_data(
 def command_extract(args: argparse.Namespace) -> int:
     db_path = Path(args.db).expanduser().resolve()
     pdf_paths = [Path(item).expanduser().resolve() for item in args.pdf]
+    pdf_size_units = getattr(args, "pdf_size_units", "decimal")
+    if pdf_size_units not in PDF_SIZE_UNIT_TABLES:
+        raise ValueError(f"Unsupported PDF size unit mode: {pdf_size_units!r}")
     for pdf_path in pdf_paths:
         if not pdf_path.is_file():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
     with connect_db(db_path) as connection:
+        existing_lto_count = connection.execute(
+            "SELECT COUNT(*) FROM lto_entries"
+        ).fetchone()[0]
+        if args.append and existing_lto_count:
+            stored_units = read_pdf_size_unit_info(connection)
+            if stored_units.mode != pdf_size_units:
+                raise RuntimeError(
+                    "Cannot append LTO records using PDF size units "
+                    f"{pdf_size_units!r}; existing intervals use "
+                    f"{stored_units.label!r}. Re-extract all PDFs into a clean "
+                    "LTO manifest instead of mixing unit interpretations."
+                )
         if not args.append:
             connection.executescript(
                 "DELETE FROM lto_entries; DELETE FROM parse_issues; DELETE FROM report_stats;"
             )
             connection.commit()
+        # Persist the interpretation before inserting any committed PDF rows so
+        # an interrupted multi-PDF extraction can never leave unlabelled ranges.
+        set_metadata(connection, "pdf_size_units", pdf_size_units)
 
         for pdf_path in pdf_paths:
             eprint(f"[extract] {pdf_path}")
-            entries, issues, stats = parse_yoyotta_pdf(pdf_path)
+            entries, issues, stats = parse_yoyotta_pdf(
+                pdf_path, pdf_size_units=pdf_size_units
+            )
             insert_lto_data(connection, entries, issues, stats)
             eprint(
                 f"[extract] project={stats['project']!r}, "
@@ -800,6 +935,33 @@ def set_metadata(connection: sqlite3.Connection, key: str, value: object) -> Non
     connection.commit()
 
 
+def read_pdf_size_unit_info(connection: sqlite3.Connection) -> PdfSizeUnitInfo:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'pdf_size_units'"
+    ).fetchone()
+    if row is None:
+        return PdfSizeUnitInfo(
+            mode="binary",
+            label="LEGACY_BINARY_ASSUMED",
+            warning=(
+                "Database has no pdf_size_units metadata. Stored intervals are "
+                "treated as legacy binary interpretation; re-extract the PDFs "
+                "with --pdf-size-units decimal if YoYotta used decimal units."
+            ),
+        )
+    value = str(row[0]).strip().lower()
+    if value in PDF_SIZE_UNIT_TABLES:
+        return PdfSizeUnitInfo(mode=value, label=value)
+    return PdfSizeUnitInfo(
+        mode="binary",
+        label=f"UNKNOWN_METADATA({value or 'empty'})_BINARY_ASSUMED",
+        warning=(
+            f"Database contains unsupported pdf_size_units={value!r}. Stored "
+            "intervals are used unchanged and reported as legacy binary-assumed."
+        ),
+    )
+
+
 def ensure_not_nested(output_path: Path, roots: Sequence[Path]) -> None:
     output_real = Path(os.path.realpath(str(output_path)))
     for root in roots:
@@ -812,6 +974,38 @@ def ensure_not_nested(output_path: Path, roots: Sequence[Path]) -> None:
             raise RuntimeError(
                 f"Output path must not be inside a source tree: {output_path} is under {root}"
             )
+
+
+def stored_source_roots(connection: sqlite3.Connection) -> List[Path]:
+    """Return all source roots recorded in rows or scan metadata."""
+    roots = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT DISTINCT source_root FROM storage_entries WHERE source_root <> ''"
+        )
+    }
+    metadata_row = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'storage_roots'"
+    ).fetchone()
+    if metadata_row:
+        try:
+            metadata_roots = json.loads(metadata_row[0])
+            if isinstance(metadata_roots, list):
+                roots.update(str(item) for item in metadata_roots if isinstance(item, str))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return [Path(root).expanduser().resolve() for root in sorted(roots)]
+
+
+def ensure_report_output_outside_stored_roots(
+    connection: sqlite3.Connection, output_path: Path
+) -> None:
+    roots = stored_source_roots(connection)
+    if not roots:
+        raise RuntimeError(
+            "Database contains no recorded storage roots; cannot verify report output safety."
+        )
+    ensure_not_nested(output_path, roots)
 
 
 def mount_options_for(path: Path) -> Optional[List[str]]:
@@ -1090,6 +1284,14 @@ def human_bytes(value: int) -> str:
     return f"{value} B"
 
 
+def signed_human_bytes(value: int) -> str:
+    """Format a byte difference with an explicit sign and binary units."""
+    if value == 0:
+        return "0 B"
+    sign = "+" if value > 0 else "-"
+    return sign + human_bytes(abs(value))
+
+
 def row_to_lto(row: sqlite3.Row) -> LtoEntry:
     return LtoEntry(
         source_pdf=row["source_pdf"],
@@ -1190,6 +1392,282 @@ def export_query_csv(
     return count
 
 
+def lto_duplicate_kind(entries: Sequence[LtoEntry]) -> str:
+    """Classify repeated LTO paths without treating identical tape copies as conflicts."""
+    if len(entries) <= 1:
+        return "none"
+    known_ranges = {
+        (entry.size_min_bytes, entry.size_max_bytes)
+        for entry in entries
+        if entry.size_known
+    }
+    if len(known_ranges) > 1:
+        return "conflicting_known_intervals"
+    if any(not entry.size_known for entry in entries):
+        return "contains_unknown_size"
+    return "identical"
+
+
+def classification_blocking_reasons(
+    status: str,
+    *,
+    storage: StorageEntry,
+    lto_kind: str,
+    storage_kind: str,
+) -> Tuple[str, ...]:
+    reasons: List[str] = []
+    status_reason = {
+        "MISSING_ON_LTO": "MISSING_ON_LTO",
+        "SIZE_MISMATCH": "SIZE_MISMATCH",
+        "ZERO_SIZE_STORAGE": "ZERO_SIZE",
+        "ZERO_SIZE_STORAGE_ONLY": "ZERO_SIZE",
+        "MATCH_PATH_ONLY_SIZE_UNKNOWN": "UNKNOWN_LTO_SIZE",
+        "AMBIGUOUS_LTO_SIZE_UNKNOWN": "UNKNOWN_LTO_SIZE",
+        "POSSIBLE_MOVED_WITHIN_TOP_FOLDER": "POSSIBLE_MOVED",
+        "AMBIGUOUS_POSSIBLE_MOVE": "AMBIGUOUS_MATCH",
+        "INVALID_FILESYSTEM_ENCODING": "INVALID_FILESYSTEM_ENCODING",
+        "CONFLICTING_LTO_ENTRIES": "CONFLICTING_LTO_ENTRIES",
+        "AMBIGUOUS_STORAGE_DUPLICATE_SIZES": "DUPLICATE_ON_STORAGE_DIFFERENT_SIZES",
+        "ZERO_SIZE_LTO_RECORD": "ZERO_SIZE_LTO_RECORD",
+    }.get(status)
+    if status_reason:
+        reasons.append(status_reason)
+    if storage.size_bytes == 0 and "ZERO_SIZE" not in reasons:
+        reasons.append("ZERO_SIZE")
+    if lto_kind == "conflicting_known_intervals" and "CONFLICTING_LTO_ENTRIES" not in reasons:
+        reasons.append("CONFLICTING_LTO_ENTRIES")
+    if lto_kind == "contains_unknown_size" and "UNKNOWN_LTO_SIZE" not in reasons:
+        reasons.append("UNKNOWN_LTO_SIZE")
+    if storage_kind == "different_sizes" and "DUPLICATE_ON_STORAGE_DIFFERENT_SIZES" not in reasons:
+        reasons.append("DUPLICATE_ON_STORAGE_DIFFERENT_SIZES")
+    return tuple(reasons)
+
+
+def classify_storage_entries(
+    lto_by_path: Dict[str, List[LtoEntry]],
+    storage_by_path: Dict[str, List[StorageEntry]],
+    *,
+    moved_check: bool = True,
+) -> List[StorageClassification]:
+    """Classify every physical storage row, retaining root and raw path identity."""
+    classifications: List[StorageClassification] = []
+    pending: List[Tuple[StorageEntry, str]] = []
+
+    def add(
+        storage: StorageEntry,
+        status: str,
+        lto_entries: Sequence[LtoEntry],
+        matched: Sequence[LtoEntry],
+        note: str,
+        storage_kind: str,
+    ) -> None:
+        lto_kind = lto_duplicate_kind(lto_entries)
+        verified = (
+            status == "MATCH"
+            and bool(matched)
+            and storage.size_bytes > 0
+            and storage.path_encoding_valid == 1
+            and lto_kind not in ("conflicting_known_intervals", "contains_unknown_size")
+            and storage_kind != "different_sizes"
+        )
+        classifications.append(
+            StorageClassification(
+                storage=storage,
+                status=status,
+                lto_entries=list(lto_entries),
+                matched_lto_entries=list(matched),
+                note=note,
+                verified_known_size_full_path=verified,
+                lto_duplicate_kind=lto_kind,
+                storage_duplicate_kind=storage_kind,
+                blocking_reasons=classification_blocking_reasons(
+                    status,
+                    storage=storage,
+                    lto_kind=lto_kind,
+                    storage_kind=storage_kind,
+                ),
+            )
+        )
+
+    for norm_path in sorted(storage_by_path):
+        storage_entries = storage_by_path[norm_path]
+        lto_entries = lto_by_path.get(norm_path, [])
+        storage_sizes = {entry.size_bytes for entry in storage_entries}
+        storage_kind = (
+            "none"
+            if len(storage_entries) <= 1
+            else "identical" if len(storage_sizes) == 1 else "different_sizes"
+        )
+        lto_kind = lto_duplicate_kind(lto_entries)
+
+        for storage in storage_entries:
+            if not storage.path_encoding_valid:
+                add(
+                    storage,
+                    "INVALID_FILESYSTEM_ENCODING",
+                    lto_entries,
+                    [],
+                    "The path contains non-UTF-8 raw filename bytes.",
+                    storage_kind,
+                )
+            elif storage_kind == "different_sizes":
+                add(
+                    storage,
+                    "AMBIGUOUS_STORAGE_DUPLICATE_SIZES",
+                    lto_entries,
+                    [],
+                    "The normalized path exists on storage with different logical sizes.",
+                    storage_kind,
+                )
+            elif storage.size_bytes == 0:
+                add(
+                    storage,
+                    "ZERO_SIZE_STORAGE" if lto_entries else "ZERO_SIZE_STORAGE_ONLY",
+                    lto_entries,
+                    [],
+                    "Storage file is zero bytes.",
+                    storage_kind,
+                )
+            elif lto_entries:
+                if lto_kind == "conflicting_known_intervals":
+                    add(
+                        storage,
+                        "CONFLICTING_LTO_ENTRIES",
+                        lto_entries,
+                        [],
+                        "LTO records for this path contain different known size intervals.",
+                        storage_kind,
+                    )
+                    continue
+
+                known_entries = [entry for entry in lto_entries if entry.size_known]
+                unknown_entries = [entry for entry in lto_entries if not entry.size_known]
+                known_matches = [
+                    entry for entry in known_entries if size_matches(storage.size_bytes, entry)
+                ]
+                if unknown_entries and known_entries:
+                    add(
+                        storage,
+                        "AMBIGUOUS_LTO_SIZE_UNKNOWN",
+                        lto_entries,
+                        known_matches,
+                        "The path has both known-size and unknown-size LTO records.",
+                        storage_kind,
+                    )
+                elif unknown_entries:
+                    add(
+                        storage,
+                        "MATCH_PATH_ONLY_SIZE_UNKNOWN",
+                        lto_entries,
+                        [],
+                        "The LTO path exists but its exact size is unknown.",
+                        storage_kind,
+                    )
+                elif known_matches:
+                    note_parts = []
+                    if lto_kind == "identical":
+                        note_parts.append("Identical LTO copies exist for this path.")
+                    if storage_kind == "identical":
+                        note_parts.append("Identical storage copies exist on multiple roots.")
+                    add(
+                        storage,
+                        "MATCH",
+                        lto_entries,
+                        known_matches,
+                        " ".join(note_parts),
+                        storage_kind,
+                    )
+                else:
+                    add(
+                        storage,
+                        "SIZE_MISMATCH",
+                        lto_entries,
+                        [],
+                        "The exact path matched, but size is outside every LTO interval.",
+                        storage_kind,
+                    )
+            else:
+                pending.append((storage, storage_kind))
+
+    lto_only = {
+        norm_path: entries
+        for norm_path, entries in lto_by_path.items()
+        if norm_path not in storage_by_path
+    }
+    move_candidates: Dict[Tuple[str, str], List[Tuple[str, List[LtoEntry]]]] = defaultdict(list)
+    if moved_check:
+        for norm_path, entries in lto_only.items():
+            first = entries[0]
+            kind = lto_duplicate_kind(entries)
+            if kind in ("conflicting_known_intervals", "contains_unknown_size"):
+                continue
+            if not any(entry.size_known for entry in entries):
+                continue
+            move_candidates[(first.norm_top_folder, first.norm_filename)].append(
+                (norm_path, entries)
+            )
+
+    compatible_by_storage: Dict[int, List[Tuple[str, List[LtoEntry]]]] = {}
+    lto_candidate_storage_paths: Dict[str, set[str]] = defaultdict(set)
+    for storage, _ in pending:
+        compatible: List[Tuple[str, List[LtoEntry]]] = []
+        for norm_path, entries in move_candidates.get(
+            (storage.norm_top_folder, storage.norm_filename), []
+        ):
+            if any(
+                entry.size_known and size_matches(storage.size_bytes, entry)
+                for entry in entries
+            ):
+                compatible.append((norm_path, entries))
+                lto_candidate_storage_paths[norm_path].add(storage.norm_path)
+        compatible_by_storage[id(storage)] = compatible
+
+    for storage, storage_kind in pending:
+        compatible = compatible_by_storage[id(storage)]
+        many_to_one = any(
+            len(lto_candidate_storage_paths[norm_path]) > 1
+            for norm_path, _ in compatible
+        )
+        if len(compatible) == 1 and not many_to_one:
+            _, entries = compatible[0]
+            add(
+                storage,
+                "POSSIBLE_MOVED_WITHIN_TOP_FOLDER",
+                entries,
+                [],
+                f"Storage path differs from LTO path {entries[0].relative_path!r}.",
+                storage_kind,
+            )
+        elif compatible:
+            entries = list(itertools.chain.from_iterable(item[1] for item in compatible))
+            add(
+                storage,
+                "AMBIGUOUS_POSSIBLE_MOVE",
+                entries,
+                [],
+                "Multiple compatible moved-file candidates exist.",
+                storage_kind,
+            )
+        else:
+            add(
+                storage,
+                "MISSING_ON_LTO",
+                [],
+                [],
+                "Eligible for copy list.",
+                storage_kind,
+            )
+
+    return sorted(
+        classifications,
+        key=lambda item: (
+            item.storage.norm_path,
+            normalize_component(item.storage.source_root),
+            item.storage.relative_path_bytes,
+        ),
+    )
+
+
 def compare_manifests(
     connection: sqlite3.Connection,
     out_dir: Path,
@@ -1197,7 +1675,6 @@ def compare_manifests(
     moved_check: bool = True,
 ) -> dict:
     lto_by_path, storage_by_path = load_grouped_manifests(connection)
-    all_paths = sorted(set(lto_by_path) | set(storage_by_path))
 
     fieldnames = [
         "status",
@@ -1228,8 +1705,6 @@ def compare_manifests(
         outputs[filename] = (handle, writer)
 
     summary = defaultdict(int)
-    storage_only: Dict[str, List[StorageEntry]] = {}
-    lto_only: Dict[str, List[LtoEntry]] = {}
 
     def base_row(
         status: str,
@@ -1260,239 +1735,73 @@ def compare_manifests(
             "note": note,
         }
 
-    for norm_path in all_paths:
-        lto_entries = lto_by_path.get(norm_path, [])
-        storage_entries = storage_by_path.get(norm_path, [])
-
-        if storage_entries and any(not entry.path_encoding_valid for entry in storage_entries):
-            row = base_row(
-                "INVALID_FILESYSTEM_ENCODING",
-                storage_entries,
-                lto_entries,
-                note=(
-                    "The path contains non-UTF-8 raw filename bytes. It was scanned and "
-                    "preserved, but is excluded from automatic matching and copy lists. "
-                    "Review scan_issues.csv and rename or map it manually if required."
-                ),
-            )
-            outputs["all_results.csv"][1].writerow(row)
-            outputs["ambiguous.csv"][1].writerow(row)
-            summary["INVALID_FILESYSTEM_ENCODING"] += 1
-            continue
-
-        if lto_entries and storage_entries:
-            distinct_storage_sizes = {entry.size_bytes for entry in storage_entries}
-            if len(distinct_storage_sizes) > 1:
-                status = "AMBIGUOUS_STORAGE_DUPLICATE_SIZES"
-                row = base_row(
-                    status,
-                    storage_entries,
-                    lto_entries,
-                    note=(
-                        "The same relative path exists under multiple storage roots with "
-                        "different logical sizes; excluded from automatic decisions."
-                    ),
-                )
-                outputs["all_results.csv"][1].writerow(row)
-                outputs["ambiguous.csv"][1].writerow(row)
-                summary[status] += 1
-                continue
-
-            storage = storage_entries[0]
-            if storage.size_bytes == 0:
-                status = "ZERO_SIZE_STORAGE"
-                row = base_row(
-                    status,
-                    storage_entries,
-                    lto_entries,
-                    note="Storage file is zero bytes; excluded from normal match logic.",
-                )
-                outputs["all_results.csv"][1].writerow(row)
-                outputs["zero_size.csv"][1].writerow(row)
-                summary[status] += 1
-                continue
-
-            zero_lto_entries = [
-                entry
-                for entry in lto_entries
-                if entry.size_known
-                and entry.size_min_bytes == 0
-                and entry.size_max_bytes == 0
-            ]
-            usable_lto_entries = [entry for entry in lto_entries if entry not in zero_lto_entries]
-            if zero_lto_entries:
-                zero_row = base_row(
-                    "ZERO_SIZE_LTO_RECORD",
-                    storage_entries,
-                    zero_lto_entries,
-                    note=(
-                        "At least one LTO manifest copy is zero bytes. Other LTO copies, "
-                        "if present, are evaluated separately."
-                    ),
-                )
-                outputs["zero_size.csv"][1].writerow(zero_row)
-                summary["ZERO_SIZE_LTO_RECORD"] += 1
-
-            known_matches = [
-                entry
-                for entry in usable_lto_entries
-                if entry.size_known and size_matches(storage.size_bytes, entry)
-            ]
-            unknown_matches = [entry for entry in usable_lto_entries if not entry.size_known]
-
-            if known_matches:
-                status = "MATCH"
-                note = ""
-                if len(lto_entries) > 1:
-                    note = "Path is present in multiple LTO manifest records."
-                if len(storage_entries) > 1:
-                    note = (note + " " if note else "") + "Path exists under multiple storage roots."
-                if zero_lto_entries:
-                    note = (note + " " if note else "") + "One or more other LTO records are zero bytes."
-                row = base_row(status, storage_entries, lto_entries, note=note)
-                outputs["all_results.csv"][1].writerow(row)
-                outputs["matches.csv"][1].writerow(row)
-                summary[status] += 1
-            elif unknown_matches:
-                status = "MATCH_PATH_ONLY_SIZE_UNKNOWN"
-                row = base_row(
-                    status,
-                    storage_entries,
-                    lto_entries,
-                    note="YoYotta sequence entry has no per-file size for this middle frame.",
-                )
-                outputs["all_results.csv"][1].writerow(row)
-                outputs["matches.csv"][1].writerow(row)
-                outputs["ambiguous.csv"][1].writerow(row)
-                summary[status] += 1
-            else:
-                status = "SIZE_MISMATCH"
-                row = base_row(
-                    status,
-                    storage_entries,
-                    lto_entries,
-                    note="Exact relative path matched, but size is outside every YoYotta rounding interval.",
-                )
-                outputs["all_results.csv"][1].writerow(row)
-                outputs["size_mismatches.csv"][1].writerow(row)
-                summary[status] += 1
-        elif storage_entries:
-            distinct_storage_sizes = {entry.size_bytes for entry in storage_entries}
-            if len(distinct_storage_sizes) > 1:
-                status = "AMBIGUOUS_STORAGE_DUPLICATE_SIZES"
-                row = base_row(
-                    status,
-                    storage_entries,
-                    [],
-                    note=(
-                        "The same relative path exists under multiple storage roots with "
-                        "different sizes; excluded from the copy list."
-                    ),
-                )
-                outputs["all_results.csv"][1].writerow(row)
-                outputs["ambiguous.csv"][1].writerow(row)
-                summary[status] += 1
-            elif storage_entries[0].size_bytes == 0:
-                status = "ZERO_SIZE_STORAGE_ONLY"
-                row = base_row(status, storage_entries, [], note="Not eligible for copy list.")
-                outputs["all_results.csv"][1].writerow(row)
-                outputs["zero_size.csv"][1].writerow(row)
-                summary[status] += 1
-            else:
-                storage_only[norm_path] = storage_entries
-        else:
-            lto_only[norm_path] = lto_entries
-
-    moved_storage_paths: set[str] = set()
-    moved_lto_paths: set[str] = set()
-    ambiguous_storage_paths: set[str] = set()
-    ambiguous_lto_paths: set[str] = set()
-
-    if moved_check:
-        storage_candidates: Dict[Tuple[str, str], List[str]] = defaultdict(list)
-        lto_candidates: Dict[Tuple[str, str], List[str]] = defaultdict(list)
-        for norm_path, entries in storage_only.items():
-            first = entries[0]
-            storage_candidates[(first.norm_top_folder, first.norm_filename)].append(norm_path)
-        for norm_path, entries in lto_only.items():
-            first = entries[0]
-            lto_candidates[(first.norm_top_folder, first.norm_filename)].append(norm_path)
-
-        for key in sorted(set(storage_candidates) & set(lto_candidates)):
-            storage_paths = storage_candidates[key]
-            lto_paths = lto_candidates[key]
-            compatible_pairs: List[Tuple[str, str]] = []
-            for storage_path in storage_paths:
-                storage_entry = storage_only[storage_path][0]
-                for lto_path in lto_paths:
-                    lto_entries = lto_only[lto_path]
-                    if any(size_matches(storage_entry.size_bytes, entry) for entry in lto_entries):
-                        compatible_pairs.append((storage_path, lto_path))
-
-            unique_storage = sorted(set(pair[0] for pair in compatible_pairs))
-            unique_lto = sorted(set(pair[1] for pair in compatible_pairs))
-            if len(compatible_pairs) == 1 and len(unique_storage) == 1 and len(unique_lto) == 1:
-                storage_path, lto_path = compatible_pairs[0]
-                storage_entries = storage_only[storage_path]
-                lto_entries = lto_only[lto_path]
-                row = base_row(
-                    "POSSIBLE_MOVED_WITHIN_TOP_FOLDER",
-                    storage_entries,
-                    lto_entries,
-                    relative_path=storage_entries[0].relative_path,
-                    note=(
-                        f"Storage path differs from LTO path {lto_entries[0].relative_path!r}; "
-                        "top-level folder, filename and size match. Review manually."
-                    ),
-                )
-                outputs["all_results.csv"][1].writerow(row)
-                outputs["possible_moved.csv"][1].writerow(row)
-                summary["POSSIBLE_MOVED_WITHIN_TOP_FOLDER"] += 1
-                moved_storage_paths.add(storage_path)
-                moved_lto_paths.add(lto_path)
-            elif compatible_pairs:
-                ambiguous_storage_paths.update(unique_storage)
-                ambiguous_lto_paths.update(unique_lto)
-                for storage_path in unique_storage:
-                    storage_entries = storage_only[storage_path]
-                    candidate_lto_paths = [
-                        lto_path
-                        for s_path, lto_path in compatible_pairs
-                        if s_path == storage_path
-                    ]
-                    lto_entries = list(
-                        itertools.chain.from_iterable(lto_only[path] for path in candidate_lto_paths)
-                    )
-                    row = base_row(
-                        "AMBIGUOUS_POSSIBLE_MOVE",
-                        storage_entries,
-                        lto_entries,
-                        note=(
-                            "Multiple same-top-folder candidates with the same filename and "
-                            "compatible size; excluded from automatic copy list."
-                        ),
-                    )
-                    outputs["all_results.csv"][1].writerow(row)
-                    outputs["ambiguous.csv"][1].writerow(row)
-                    summary["AMBIGUOUS_POSSIBLE_MOVE"] += 1
+    classifications = classify_storage_entries(
+        lto_by_path, storage_by_path, moved_check=moved_check
+    )
+    classifications_by_path: Dict[str, List[StorageClassification]] = defaultdict(list)
+    for classification in classifications:
+        classifications_by_path[classification.storage.norm_path].append(classification)
 
     missing_on_lto_rows: List[dict] = []
-    for norm_path, storage_entries in sorted(storage_only.items()):
-        if norm_path in moved_storage_paths or norm_path in ambiguous_storage_paths:
-            continue
-        row = base_row(
-            "MISSING_ON_LTO",
-            storage_entries,
-            [],
-            note="Eligible for copy list.",
-        )
+    used_moved_lto_paths: set[str] = set()
+    for norm_path in sorted(classifications_by_path):
+        path_classifications = classifications_by_path[norm_path]
+        representative = path_classifications[0]
+        storage_entries = [item.storage for item in path_classifications]
+        lto_entries = representative.lto_entries
+        status = representative.status
+        row = base_row(status, storage_entries, lto_entries, note=representative.note)
         outputs["all_results.csv"][1].writerow(row)
-        outputs["missing_on_lto.csv"][1].writerow(row)
-        missing_on_lto_rows.append(row)
-        summary["MISSING_ON_LTO"] += 1
+        summary[status] += 1
 
+        if status == "MATCH":
+            outputs["matches.csv"][1].writerow(row)
+        elif status in ("MATCH_PATH_ONLY_SIZE_UNKNOWN", "AMBIGUOUS_LTO_SIZE_UNKNOWN"):
+            outputs["matches.csv"][1].writerow(row)
+            outputs["ambiguous.csv"][1].writerow(row)
+        elif status == "SIZE_MISMATCH":
+            outputs["size_mismatches.csv"][1].writerow(row)
+        elif status == "MISSING_ON_LTO":
+            outputs["missing_on_lto.csv"][1].writerow(row)
+            missing_on_lto_rows.append(row)
+        elif status == "POSSIBLE_MOVED_WITHIN_TOP_FOLDER":
+            outputs["possible_moved.csv"][1].writerow(row)
+            used_moved_lto_paths.update(entry.norm_path for entry in lto_entries)
+        elif status in (
+            "ZERO_SIZE_STORAGE",
+            "ZERO_SIZE_STORAGE_ONLY",
+        ):
+            outputs["zero_size.csv"][1].writerow(row)
+        else:
+            outputs["ambiguous.csv"][1].writerow(row)
+            if status == "AMBIGUOUS_POSSIBLE_MOVE":
+                used_moved_lto_paths.update(entry.norm_path for entry in lto_entries)
+
+        exact_lto_entries = lto_by_path.get(norm_path, [])
+        zero_lto_entries = [
+            entry
+            for entry in exact_lto_entries
+            if entry.size_known
+            and entry.size_min_bytes == 0
+            and entry.size_max_bytes == 0
+        ]
+        if zero_lto_entries:
+            zero_row = base_row(
+                "ZERO_SIZE_LTO_RECORD",
+                storage_entries,
+                zero_lto_entries,
+                note="At least one LTO manifest record is zero bytes.",
+            )
+            outputs["zero_size.csv"][1].writerow(zero_row)
+            summary["ZERO_SIZE_LTO_RECORD"] += 1
+
+    lto_only = {
+        norm_path: entries
+        for norm_path, entries in lto_by_path.items()
+        if norm_path not in storage_by_path
+    }
     for norm_path, lto_entries in sorted(lto_only.items()):
-        if norm_path in moved_lto_paths or norm_path in ambiguous_lto_paths:
+        if norm_path in used_moved_lto_paths:
             continue
         zero_entries = [
             entry
@@ -1723,13 +2032,916 @@ def write_copy_lists(out_dir: Path, missing_rows: Sequence[dict]) -> None:
                     out.write(relative_raw + b"\0")
 
 
+def raw_top_folder(relative_path_bytes: bytes) -> bytes:
+    return relative_path_bytes.split(b"/", 1)[0] if relative_path_bytes else b""
+
+
+def issue_folder_key(source_root: str, issue_path: str) -> Optional[Tuple[str, bytes]]:
+    """Best-effort localization of a scan issue without touching source storage."""
+    root_text = os.path.normpath(source_root)
+    path_text = os.path.normpath(issue_path)
+    try:
+        if os.path.commonpath([root_text, path_text]) != root_text:
+            return None
+    except ValueError:
+        return None
+    relative = os.path.relpath(path_text, root_text)
+    if relative in ("", ".") or relative == ".." or relative.startswith("../"):
+        return None
+    top_display = relative.split(os.sep, 1)[0]
+    if "\\x" in top_display:
+        # Escaped display text is not reversible to an exact physical identity.
+        return None
+    return source_root, os.fsencode(top_display)
+
+
+def load_scan_stats(connection: sqlite3.Connection) -> Dict[str, int]:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'storage_scan_stats'"
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        value = json.loads(row[0])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, list):
+        return {}
+    result: Dict[str, int] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        root = item.get("source_root")
+        files = item.get("files")
+        if isinstance(root, str) and isinstance(files, int):
+            result[root] = files
+    return result
+
+
+def summarize_lto_size_groups(
+    groups: Iterable[Sequence[LtoEntry]],
+) -> LtoSizeTotals:
+    """Sum one logical contribution per normalized LTO path.
+
+    Identical known intervals contribute once. Conflicting known intervals are
+    exposed and omitted because selecting one would make the total misleading.
+    Unknown records never contribute bytes, including when a known duplicate is
+    available for the same path.
+    """
+    totals = LtoSizeTotals()
+    for entries in groups:
+        if not entries:
+            continue
+        totals.path_count += 1
+        ranges: Dict[Tuple[int, int], set[str]] = defaultdict(set)
+        has_unknown = False
+        for entry in entries:
+            if entry.size_known:
+                assert entry.size_min_bytes is not None
+                assert entry.size_max_bytes is not None
+                ranges[(entry.size_min_bytes, entry.size_max_bytes)].add(entry.tape)
+            else:
+                has_unknown = True
+        totals.additional_identical_tape_copy_count += sum(
+            max(0, len(tapes) - 1) for tapes in ranges.values()
+        )
+        if has_unknown:
+            totals.unknown_size_count += 1
+        if len(ranges) > 1:
+            totals.conflicting_size_path_count += 1
+            continue
+        if len(ranges) == 1:
+            (minimum, maximum), = ranges
+            totals.known_size_count += 1
+            totals.total_min_bytes += minimum
+            totals.total_max_bytes += maximum
+    return totals
+
+
+def folder_interval_result(
+    storage_total: int,
+    totals: LtoSizeTotals,
+    *,
+    no_paths_result: str,
+) -> str:
+    if totals.path_count == 0:
+        return no_paths_result
+    if totals.unknown_size_count or totals.conflicting_size_path_count:
+        return "UNKNOWN_LTO_SIZES"
+    if totals.total_min_bytes <= storage_total <= totals.total_max_bytes:
+        return "WITHIN_INTERVAL"
+    return "OUTSIDE_INTERVAL"
+
+
+def build_folder_audits(connection: sqlite3.Connection) -> List[FolderAudit]:
+    lto_by_path, storage_by_path = load_grouped_manifests(connection)
+    classifications = classify_storage_entries(lto_by_path, storage_by_path)
+    folders: Dict[Tuple[str, bytes], FolderAudit] = {}
+
+    for classification in classifications:
+        storage = classification.storage
+        top_raw = raw_top_folder(storage.relative_path_bytes)
+        key = (storage.source_root, top_raw)
+        folder = folders.get(key)
+        if folder is None:
+            folder = FolderAudit(
+                source_root=storage.source_root,
+                top_folder_bytes=top_raw,
+                top_folder=safe_filesystem_display(os.fsdecode(top_raw)),
+                norm_top_folder=storage.norm_top_folder,
+                classifications=[],
+                blocking_reasons=[],
+                scan_issue_types=[],
+                matched_lto_totals=LtoSizeTotals(),
+                manifest_lto_totals=LtoSizeTotals(),
+                storage_norm_paths=set(),
+                manifest_norm_paths=set(),
+            )
+            folders[key] = folder
+        folder.classifications.append(classification)
+        folder.blocking_reasons.extend(classification.blocking_reasons)
+        if not classification.verified_known_size_full_path and not classification.blocking_reasons:
+            folder.blocking_reasons.append("INCOMPLETE_CLASSIFICATION")
+        if not top_raw:
+            folder.blocking_reasons.append("INCOMPLETE_CLASSIFICATION")
+
+    issues = list(
+        connection.execute(
+            "SELECT source_root, path, issue_type, details "
+            "FROM scan_issues ORDER BY source_root, path, issue_type, id"
+        )
+    )
+    root_wide_issues: Dict[str, List[str]] = defaultdict(list)
+    for issue in issues:
+        issue_type = str(issue["issue_type"])
+        if issue_type == "non_utf8_filesystem_name":
+            continue
+        key = issue_folder_key(str(issue["source_root"]), str(issue["path"]))
+        reason = issue_type.upper()
+        if key is None:
+            root_wide_issues[str(issue["source_root"])].append(reason)
+            continue
+        folder = folders.get(key)
+        if folder is None:
+            folder = FolderAudit(
+                source_root=key[0],
+                top_folder_bytes=key[1],
+                top_folder=safe_filesystem_display(os.fsdecode(key[1])),
+                norm_top_folder=normalize_component(os.fsdecode(key[1])),
+                classifications=[],
+                blocking_reasons=[],
+                scan_issue_types=[],
+                matched_lto_totals=LtoSizeTotals(),
+                manifest_lto_totals=LtoSizeTotals(),
+                storage_norm_paths=set(),
+                manifest_norm_paths=set(),
+            )
+            folders[key] = folder
+        folder.blocking_reasons.append(reason)
+        folder.scan_issue_types.append(issue_type)
+
+    for folder in folders.values():
+        for reason in root_wide_issues.get(folder.source_root, []):
+            folder.blocking_reasons.append(reason)
+            folder.scan_issue_types.append(reason.lower())
+
+    expected_by_root = load_scan_stats(connection)
+    actual_by_root: Dict[str, int] = defaultdict(int)
+    for classification in classifications:
+        actual_by_root[classification.storage.source_root] += 1
+    for root, expected in expected_by_root.items():
+        if actual_by_root.get(root, 0) != expected:
+            for folder in folders.values():
+                if folder.source_root == root:
+                    folder.blocking_reasons.append("INCOMPLETE_CLASSIFICATION")
+
+    lto_by_top_folder: Dict[str, Dict[str, List[LtoEntry]]] = defaultdict(dict)
+    for norm_path, entries in lto_by_path.items():
+        if entries:
+            lto_by_top_folder[entries[0].norm_top_folder][norm_path] = entries
+    for folder in folders.values():
+        folder.storage_norm_paths = {
+            item.storage.norm_path for item in folder.classifications
+        }
+        manifest_groups = lto_by_top_folder.get(folder.norm_top_folder, {})
+        folder.manifest_norm_paths = set(manifest_groups)
+        folder.matched_lto_totals = summarize_lto_size_groups(
+            lto_by_path[norm_path]
+            for norm_path in sorted(folder.storage_norm_paths)
+            if norm_path in lto_by_path
+        )
+        folder.manifest_lto_totals = summarize_lto_size_groups(
+            manifest_groups[norm_path] for norm_path in sorted(manifest_groups)
+        )
+
+    return sorted(
+        folders.values(),
+        key=lambda folder: (
+            normalize_component(folder.source_root),
+            folder.source_root,
+            folder.top_folder_bytes,
+        ),
+    )
+
+
+def folder_absolute_bytes(folder: FolderAudit) -> bytes:
+    root_raw = os.fsencode(folder.source_root)
+    if root_raw == b"/":
+        return root_raw + folder.top_folder_bytes
+    return root_raw.rstrip(b"/") + b"/" + folder.top_folder_bytes
+
+
+def folder_report_row(folder: FolderAudit) -> dict:
+    classifications = folder.classifications
+    status_counts: Dict[str, int] = defaultdict(int)
+    tapes = set()
+    lto_copy_count = 0
+    for classification in classifications:
+        status_counts[classification.status] += 1
+        tapes.update(entry.tape for entry in classification.matched_lto_entries)
+        lto_copy_count += len(classification.matched_lto_entries)
+    reasons = sorted(set(folder.blocking_reasons))
+    safe = bool(classifications) and not reasons and all(
+        item.verified_known_size_full_path for item in classifications
+    )
+    if not safe and not reasons:
+        reasons = ["INCOMPLETE_CLASSIFICATION"]
+    absolute_raw = folder_absolute_bytes(folder)
+    absolute_display = safe_filesystem_display(os.fsdecode(absolute_raw))
+    decision = "SAFE_TO_DELETE" if safe else "BLOCKED"
+    storage_total = sum(item.storage.size_bytes for item in classifications)
+    matched = folder.matched_lto_totals
+    matched_midpoint = (matched.total_min_bytes + matched.total_max_bytes) // 2
+    matched_result = folder_interval_result(
+        storage_total, matched, no_paths_result="NO_MATCHED_LTO_PATHS"
+    )
+    manifest = folder.manifest_lto_totals
+    manifest_result = folder_interval_result(
+        storage_total, manifest, no_paths_result="NO_LTO_FOLDER"
+    )
+    matched_diff_min = storage_total - matched.total_min_bytes
+    matched_diff_max = storage_total - matched.total_max_bytes
+    matched_diff_midpoint = storage_total - matched_midpoint
+    manifest_diff_min = storage_total - manifest.total_min_bytes
+    manifest_diff_max = storage_total - manifest.total_max_bytes
+    return {
+        "source_root": folder.source_root,
+        "folder_name": folder.top_folder,
+        "absolute_path": absolute_display,
+        "decision": decision,
+        "blocking_reasons": " | ".join(reasons),
+        "storage_file_count": len(classifications),
+        "storage_total_size_bytes": storage_total,
+        "storage_total_size_human": human_bytes(storage_total),
+        "lto_matched_path_count": matched.path_count,
+        "lto_known_size_file_count": matched.known_size_count,
+        "lto_unknown_size_file_count": matched.unknown_size_count,
+        "lto_conflicting_size_path_count": matched.conflicting_size_path_count,
+        "lto_additional_identical_tape_copy_count": (
+            matched.additional_identical_tape_copy_count
+        ),
+        "lto_total_size_min_bytes": matched.total_min_bytes,
+        "lto_total_size_max_bytes": matched.total_max_bytes,
+        "lto_total_size_midpoint_bytes": matched_midpoint,
+        "lto_total_size_min_human": human_bytes(matched.total_min_bytes),
+        "lto_total_size_max_human": human_bytes(matched.total_max_bytes),
+        "lto_total_size_midpoint_human": human_bytes(matched_midpoint),
+        "lto_folder_manifest_file_count": manifest.path_count,
+        "lto_folder_manifest_known_size_count": manifest.known_size_count,
+        "lto_folder_manifest_unknown_size_count": manifest.unknown_size_count,
+        "lto_folder_manifest_conflicting_size_path_count": (
+            manifest.conflicting_size_path_count
+        ),
+        "lto_folder_manifest_additional_identical_tape_copy_count": (
+            manifest.additional_identical_tape_copy_count
+        ),
+        "lto_folder_manifest_total_min_bytes": manifest.total_min_bytes,
+        "lto_folder_manifest_total_max_bytes": manifest.total_max_bytes,
+        "lto_folder_manifest_total_min_human": human_bytes(manifest.total_min_bytes),
+        "lto_folder_manifest_total_max_human": human_bytes(manifest.total_max_bytes),
+        "storage_minus_lto_min_bytes": matched_diff_min,
+        "storage_minus_lto_max_bytes": matched_diff_max,
+        "storage_minus_lto_midpoint_bytes": matched_diff_midpoint,
+        "storage_minus_lto_min_human": signed_human_bytes(matched_diff_min),
+        "storage_minus_lto_max_human": signed_human_bytes(matched_diff_max),
+        "storage_minus_lto_midpoint_human": signed_human_bytes(matched_diff_midpoint),
+        "storage_size_within_lto_folder_interval": (
+            "YES"
+            if matched_result == "WITHIN_INTERVAL"
+            else "NO" if matched_result == "OUTSIDE_INTERVAL" else ""
+        ),
+        "folder_size_interval_result": matched_result,
+        "storage_minus_lto_manifest_min_bytes": manifest_diff_min,
+        "storage_minus_lto_manifest_max_bytes": manifest_diff_max,
+        "storage_minus_lto_manifest_min_human": signed_human_bytes(manifest_diff_min),
+        "storage_minus_lto_manifest_max_human": signed_human_bytes(manifest_diff_max),
+        "manifest_folder_size_interval_result": manifest_result,
+        # Compatibility aliases retained for existing consumers.
+        "status": decision,
+        "top_folder": folder.top_folder,
+        "absolute_folder": absolute_display,
+        "file_count": len(classifications),
+        "verified_file_count": sum(
+            1 for item in classifications if item.verified_known_size_full_path
+        ),
+        "total_size_bytes": storage_total,
+        "lto_copy_count": lto_copy_count,
+        "lto_tapes": " | ".join(sorted(tapes)),
+        "classification_counts": json.dumps(
+            dict(sorted(status_counts.items())), ensure_ascii=False, sort_keys=True
+        ),
+        "scan_issue_types": " | ".join(sorted(set(folder.scan_issue_types))),
+        "_absolute_folder_bytes": absolute_raw,
+    }
+
+
+SIMPLE_REASON_ORDER = [
+    "NO_LTO_FOLDER",
+    "UNKNOWN_LTO_SIZE",
+    "CONFLICTING_LTO_ENTRIES",
+    "STORAGE_ONLY_PATH",
+    "LTO_ONLY_PATH",
+    "SIZE_MISMATCH",
+    "AMBIGUOUS_PATH",
+    "FILE_COUNT_MISMATCH",
+    "SIZE_OUTSIDE_TOLERANCE",
+    "ZERO_SIZE_FILE",
+    "SCAN_INCOMPLETE",
+    "INVALID_FILESYSTEM_ENCODING",
+]
+
+
+def simple_size_compatible(
+    storage_size: int,
+    lto_min: int,
+    lto_max: int,
+    *,
+    tolerance_percent: float,
+    tolerance_bytes: int,
+) -> bool:
+    expansion = Decimal(storage_size) * Decimal(str(tolerance_percent)) / Decimal(100)
+    within_expanded = (
+        Decimal(lto_min) - expansion
+        <= Decimal(storage_size)
+        <= Decimal(lto_max) + expansion
+    )
+    if storage_size < lto_min:
+        nearest_difference = lto_min - storage_size
+    elif storage_size > lto_max:
+        nearest_difference = storage_size - lto_max
+    else:
+        nearest_difference = 0
+    return within_expanded or nearest_difference <= tolerance_bytes
+
+
+def evaluate_simple_folder_result(
+    folder: FolderAudit,
+    *,
+    tolerance_percent: float,
+    tolerance_bytes: int,
+) -> SimpleFolderEvaluation:
+    classifications = folder.classifications
+    statuses = [item.status for item in classifications]
+    storage_count = len(classifications)
+    manifest = folder.manifest_lto_totals
+    storage_size = sum(item.storage.size_bytes for item in classifications)
+
+    known_matches = statuses.count("MATCH")
+    unknown_matches = statuses.count("MATCH_PATH_ONLY_SIZE_UNKNOWN")
+    storage_only = len(folder.storage_norm_paths - folder.manifest_norm_paths)
+    lto_only = len(folder.manifest_norm_paths - folder.storage_norm_paths)
+    size_mismatches = statuses.count("SIZE_MISMATCH")
+    ambiguous_statuses = {
+        "POSSIBLE_MOVED_WITHIN_TOP_FOLDER",
+        "AMBIGUOUS_POSSIBLE_MOVE",
+        "AMBIGUOUS_LTO_SIZE_UNKNOWN",
+        "AMBIGUOUS_STORAGE_DUPLICATE_SIZES",
+    }
+    ambiguous = sum(status in ambiguous_statuses for status in statuses)
+    conflicts = manifest.conflicting_size_path_count
+    zero_files = sum(item.storage.size_bytes == 0 for item in classifications)
+    invalid_encoding = sum(
+        not item.storage.path_encoding_valid for item in classifications
+    )
+    scan_issues = len(folder.scan_issue_types)
+    if "INCOMPLETE_CLASSIFICATION" in folder.blocking_reasons and not scan_issues:
+        scan_issues = 1
+
+    aggregate_interval_usable = (
+        manifest.path_count > 0
+        and manifest.known_size_count > 0
+        and conflicts == 0
+    )
+    aggregate_size_ok = (
+        simple_size_compatible(
+            storage_size,
+            manifest.total_min_bytes,
+            manifest.total_max_bytes,
+            tolerance_percent=tolerance_percent,
+            tolerance_bytes=tolerance_bytes,
+        )
+        if aggregate_interval_usable
+        else False
+    )
+    aggregate_result = (
+        "WITHIN_TOLERANCE"
+        if aggregate_size_ok
+        else "OUTSIDE_TOLERANCE" if aggregate_interval_usable else "UNKNOWN"
+    )
+    count_ok = storage_count == manifest.path_count
+    exact_path_coverage = storage_only == 0 and lto_only == 0
+    no_serious_errors = (
+        conflicts == 0
+        and ambiguous == 0
+        and zero_files == 0
+        and scan_issues == 0
+        and invalid_encoding == 0
+        and storage_count > 0
+    )
+
+    all_known_verified = known_matches == storage_count
+    unknown_only_exception = (
+        unknown_matches > 0
+        and known_matches + unknown_matches == storage_count
+        and all(
+            status in ("MATCH", "MATCH_PATH_ONLY_SIZE_UNKNOWN")
+            for status in statuses
+        )
+    )
+    file_warning_exception = (
+        size_mismatches > 0
+        and known_matches + unknown_matches + size_mismatches == storage_count
+        and all(
+            status in (
+                "MATCH",
+                "MATCH_PATH_ONLY_SIZE_UNKNOWN",
+                "SIZE_MISMATCH",
+            )
+            for status in statuses
+        )
+    )
+    if (
+        all_known_verified
+        and count_ok
+        and exact_path_coverage
+        and no_serious_errors
+        and size_mismatches == 0
+        and manifest.unknown_size_count == 0
+        and aggregate_size_ok
+    ):
+        result = "YES"
+        reasons = ("OK",)
+    elif (
+        unknown_only_exception
+        and count_ok
+        and exact_path_coverage
+        and no_serious_errors
+        and size_mismatches == 0
+        and manifest.unknown_size_count > 0
+        and aggregate_size_ok
+    ):
+        result = "YES_WITH_UNKNOWN_SIZE"
+        reasons = ("INDIVIDUAL_LTO_SIZE_UNKNOWN_AGGREGATE_MATCH",)
+    elif (
+        file_warning_exception
+        and count_ok
+        and exact_path_coverage
+        and no_serious_errors
+        and aggregate_size_ok
+    ):
+        result = "YES_WITH_FILE_WARNINGS"
+        warning_reasons = ["INDIVIDUAL_SIZE_MISMATCH_AGGREGATE_MATCH"]
+        if unknown_matches:
+            warning_reasons.append(
+                "INDIVIDUAL_LTO_SIZE_UNKNOWN_AGGREGATE_MATCH"
+            )
+        reasons = tuple(warning_reasons)
+    else:
+        present_reasons = set()
+        if manifest.path_count == 0:
+            present_reasons.add("NO_LTO_FOLDER")
+        if manifest.unknown_size_count:
+            present_reasons.add("UNKNOWN_LTO_SIZE")
+        if conflicts:
+            present_reasons.add("CONFLICTING_LTO_ENTRIES")
+        if storage_only:
+            present_reasons.add("STORAGE_ONLY_PATH")
+        if lto_only:
+            present_reasons.add("LTO_ONLY_PATH")
+        if size_mismatches:
+            present_reasons.add("SIZE_MISMATCH")
+        if ambiguous:
+            present_reasons.add("AMBIGUOUS_PATH")
+        unsupported_statuses = storage_count - known_matches - unknown_matches
+        if unsupported_statuses and not (
+            size_mismatches or ambiguous or storage_only or zero_files or invalid_encoding
+        ):
+            present_reasons.add("AMBIGUOUS_PATH")
+        if not count_ok:
+            present_reasons.add("FILE_COUNT_MISMATCH")
+        if aggregate_interval_usable and not aggregate_size_ok:
+            present_reasons.add("SIZE_OUTSIDE_TOLERANCE")
+        if zero_files:
+            present_reasons.add("ZERO_SIZE_FILE")
+        if scan_issues or storage_count == 0:
+            present_reasons.add("SCAN_INCOMPLETE")
+        if invalid_encoding:
+            present_reasons.add("INVALID_FILESYSTEM_ENCODING")
+        reasons = tuple(
+            reason for reason in SIMPLE_REASON_ORDER if reason in present_reasons
+        )
+        if not reasons:
+            reasons = ("AMBIGUOUS_PATH",)
+        result = "NO"
+
+    return SimpleFolderEvaluation(
+        result=result,
+        reason_codes=reasons,
+        known_size_match_count=known_matches,
+        unknown_size_path_match_count=unknown_matches,
+        storage_only_path_count=storage_only,
+        lto_only_path_count=lto_only,
+        size_mismatch_count=size_mismatches,
+        conflicting_lto_path_count=conflicts,
+        ambiguous_path_count=ambiguous,
+        zero_size_file_count=zero_files,
+        scan_issue_count=scan_issues,
+        invalid_encoding_count=invalid_encoding,
+        aggregate_size_result=aggregate_result,
+    )
+
+
+def build_simple_folder_rows(
+    folders: Sequence[FolderAudit],
+    *,
+    pdf_size_units: PdfSizeUnitInfo,
+    tolerance_percent: float,
+    tolerance_bytes: int,
+) -> List[dict]:
+    rows: List[dict] = []
+    for folder in folders:
+        evaluation = evaluate_simple_folder_result(
+            folder,
+            tolerance_percent=tolerance_percent,
+            tolerance_bytes=tolerance_bytes,
+        )
+        storage_count = len(folder.classifications)
+        storage_size = sum(
+            item.storage.size_bytes for item in folder.classifications
+        )
+        manifest = folder.manifest_lto_totals
+        interval_available = (
+            manifest.path_count > 0
+            and manifest.known_size_count > 0
+            and manifest.conflicting_size_path_count == 0
+        )
+        midpoint = (manifest.total_min_bytes + manifest.total_max_bytes) // 2
+        difference = storage_size - midpoint if interval_available else None
+        difference_percent = (
+            abs(difference) / max(storage_size, 1) * 100
+            if difference is not None
+            else None
+        )
+        count_ok = storage_count == manifest.path_count
+        absolute_path = safe_filesystem_display(
+            os.fsdecode(folder_absolute_bytes(folder))
+        )
+        rows.append(
+            {
+                "folder_name": folder.top_folder,
+                "storage_size": human_bytes(storage_size),
+                "lto_size": human_bytes(midpoint) if interval_available else "UNKNOWN",
+                "storage_file_count": storage_count,
+                "lto_file_count": manifest.path_count,
+                "result": evaluation.result,
+                "source_root": folder.source_root,
+                "absolute_path": absolute_path,
+                "storage_size_bytes": storage_size,
+                "lto_size_min_bytes": (
+                    manifest.total_min_bytes if interval_available else ""
+                ),
+                "lto_size_max_bytes": (
+                    manifest.total_max_bytes if interval_available else ""
+                ),
+                "lto_size_midpoint_bytes": midpoint if interval_available else "",
+                "size_difference_bytes": difference if difference is not None else "",
+                "size_difference_percent": (
+                    f"{difference_percent:.4f}" if difference_percent is not None else ""
+                ),
+                "size_result": evaluation.aggregate_size_result,
+                "file_count_result": "MATCH" if count_ok else "MISMATCH",
+                "known_size_match_count": evaluation.known_size_match_count,
+                "unknown_size_path_match_count": (
+                    evaluation.unknown_size_path_match_count
+                ),
+                "storage_only_path_count": evaluation.storage_only_path_count,
+                "lto_only_path_count": evaluation.lto_only_path_count,
+                "size_mismatch_count": evaluation.size_mismatch_count,
+                "conflicting_lto_path_count": (
+                    evaluation.conflicting_lto_path_count
+                ),
+                "ambiguous_path_count": evaluation.ambiguous_path_count,
+                "zero_size_file_count": evaluation.zero_size_file_count,
+                "scan_issue_count": evaluation.scan_issue_count,
+                "invalid_encoding_count": evaluation.invalid_encoding_count,
+                "aggregate_size_result": evaluation.aggregate_size_result,
+                "reason": " | ".join(evaluation.reason_codes),
+                "pdf_size_units": pdf_size_units.label,
+            }
+        )
+    return rows
+
+
+def print_simple_folder_table(
+    rows: Sequence[dict],
+    *,
+    pdf_size_units: PdfSizeUnitInfo,
+    tolerance_percent: float,
+    tolerance_bytes: int,
+) -> None:
+    print("Simple folder check settings:")
+    print(f"  PDF size unit mode: {pdf_size_units.label}")
+    print(f"  Percentage tolerance: {tolerance_percent:g}%")
+    print(
+        f"  Byte tolerance: {tolerance_bytes} bytes "
+        f"({human_bytes(tolerance_bytes)})"
+    )
+    if pdf_size_units.warning:
+        print(f"WARNING: {pdf_size_units.warning}")
+
+    duplicate_names = {
+        name
+        for name, count in (
+            (name, sum(1 for row in rows if row["folder_name"] == name))
+            for name in sorted({str(row["folder_name"]) for row in rows})
+        )
+        if count > 1
+    }
+    root_labels: Dict[Tuple[str, str], str] = {}
+    for folder_name in sorted(duplicate_names):
+        roots = sorted(
+            {str(row["source_root"]) for row in rows if row["folder_name"] == folder_name}
+        )
+        basenames = [Path(root).name or root for root in roots]
+        labels = (
+            basenames
+            if len(set(basenames)) == len(basenames)
+            else [f"root_{index:02d}" for index in range(1, len(roots) + 1)]
+        )
+        root_labels.update(
+            ((folder_name, root), label)
+            for root, label in zip(roots, labels)
+        )
+    display_rows = []
+    for row in rows:
+        folder_label = str(row["folder_name"])
+        if folder_label in duplicate_names:
+            root_id = root_labels[(folder_label, str(row["source_root"]))]
+            folder_label += f" [{root_id}]"
+        if len(folder_label) > 40:
+            folder_label = folder_label[:37] + "..."
+        display_rows.append(
+            [
+                folder_label,
+                str(row["storage_size"]),
+                str(row["lto_size"]),
+                str(row["storage_file_count"]),
+                str(row["lto_file_count"]),
+                str(row["result"]),
+            ]
+        )
+
+    headings = ["Folder", "Disk", "LTO", "Disk files", "LTO files", "Result"]
+    widths = [
+        max([len(headings[index])] + [len(row[index]) for row in display_rows])
+        for index in range(len(headings))
+    ]
+
+    def table_line(values: Sequence[str]) -> str:
+        return "  ".join(
+            value.ljust(widths[index]) for index, value in enumerate(values)
+        ).rstrip()
+
+    print("")
+    print(table_line(headings))
+    print(table_line(["-" * width for width in widths]))
+    for row in display_rows:
+        print(table_line(row))
+
+    result_order = (
+        "YES",
+        "YES_WITH_UNKNOWN_SIZE",
+        "YES_WITH_FILE_WARNINGS",
+        "NO",
+    )
+    grouped_rows = {
+        result: [row for row in rows if row["result"] == result]
+        for result in result_order
+    }
+    print("")
+    print("Simple folder check:")
+    for result in result_order:
+        print(f"  {result}: {len(grouped_rows[result])} folders")
+    for result in result_order:
+        total = sum(
+            int(row["storage_size_bytes"]) for row in grouped_rows[result]
+        )
+        print(f"Total storage size {result}: {human_bytes(total)}")
+
+
+def write_deletable_folder_reports(
+    connection: sqlite3.Connection,
+    out_dir: Path,
+    *,
+    pdf_size_units: Optional[PdfSizeUnitInfo] = None,
+    simple_size_tolerance_percent: float = 0.1,
+    simple_size_tolerance_bytes: int = 10485760,
+) -> dict:
+    folders = build_folder_audits(connection)
+    rows = [folder_report_row(folder) for folder in folders]
+    safe_rows = [row for row in rows if row["status"] == "SAFE_TO_DELETE"]
+    blocked_rows = [row for row in rows if row["status"] == "BLOCKED"]
+    fieldnames = [
+        "source_root",
+        "folder_name",
+        "absolute_path",
+        "decision",
+        "blocking_reasons",
+        "storage_file_count",
+        "storage_total_size_bytes",
+        "storage_total_size_human",
+        "lto_matched_path_count",
+        "lto_known_size_file_count",
+        "lto_unknown_size_file_count",
+        "lto_conflicting_size_path_count",
+        "lto_additional_identical_tape_copy_count",
+        "lto_total_size_min_bytes",
+        "lto_total_size_max_bytes",
+        "lto_total_size_midpoint_bytes",
+        "lto_total_size_min_human",
+        "lto_total_size_max_human",
+        "lto_total_size_midpoint_human",
+        "lto_folder_manifest_file_count",
+        "lto_folder_manifest_known_size_count",
+        "lto_folder_manifest_unknown_size_count",
+        "lto_folder_manifest_conflicting_size_path_count",
+        "lto_folder_manifest_additional_identical_tape_copy_count",
+        "lto_folder_manifest_total_min_bytes",
+        "lto_folder_manifest_total_max_bytes",
+        "lto_folder_manifest_total_min_human",
+        "lto_folder_manifest_total_max_human",
+        "storage_minus_lto_min_bytes",
+        "storage_minus_lto_max_bytes",
+        "storage_minus_lto_midpoint_bytes",
+        "storage_minus_lto_min_human",
+        "storage_minus_lto_max_human",
+        "storage_minus_lto_midpoint_human",
+        "storage_size_within_lto_folder_interval",
+        "folder_size_interval_result",
+        "storage_minus_lto_manifest_min_bytes",
+        "storage_minus_lto_manifest_max_bytes",
+        "storage_minus_lto_manifest_min_human",
+        "storage_minus_lto_manifest_max_human",
+        "manifest_folder_size_interval_result",
+        "status",
+        "top_folder",
+        "absolute_folder",
+        "file_count",
+        "verified_file_count",
+        "total_size_bytes",
+        "lto_copy_count",
+        "lto_tapes",
+        "classification_counts",
+        "scan_issue_types",
+    ]
+    for filename, selected in (
+        ("deletable_folders.csv", safe_rows),
+        ("blocked_folders.csv", blocked_rows),
+    ):
+        with (out_dir / filename).open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(selected)
+
+    with (out_dir / "folder_size_comparison.csv").open(
+        "w", encoding="utf-8-sig", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    unit_info = pdf_size_units or read_pdf_size_unit_info(connection)
+    simple_rows = build_simple_folder_rows(
+        folders,
+        pdf_size_units=unit_info,
+        tolerance_percent=simple_size_tolerance_percent,
+        tolerance_bytes=simple_size_tolerance_bytes,
+    )
+    simple_fieldnames = [
+        "folder_name",
+        "storage_size",
+        "lto_size",
+        "storage_file_count",
+        "lto_file_count",
+        "result",
+        "source_root",
+        "absolute_path",
+        "storage_size_bytes",
+        "lto_size_min_bytes",
+        "lto_size_max_bytes",
+        "lto_size_midpoint_bytes",
+        "size_difference_bytes",
+        "size_difference_percent",
+        "size_result",
+        "file_count_result",
+        "known_size_match_count",
+        "unknown_size_path_match_count",
+        "storage_only_path_count",
+        "lto_only_path_count",
+        "size_mismatch_count",
+        "conflicting_lto_path_count",
+        "ambiguous_path_count",
+        "zero_size_file_count",
+        "scan_issue_count",
+        "invalid_encoding_count",
+        "aggregate_size_result",
+        "reason",
+        "pdf_size_units",
+    ]
+    with (out_dir / "simple_folder_check.csv").open(
+        "w", encoding="utf-8-sig", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=simple_fieldnames)
+        writer.writeheader()
+        writer.writerows(simple_rows)
+
+    with (out_dir / "deletable_folders.txt").open(
+        "w", encoding="utf-8", errors="backslashreplace", newline="\n"
+    ) as handle:
+        for row in safe_rows:
+            handle.write(str(row["absolute_folder"]) + "\n")
+    with (out_dir / "deletable_folders.nul").open("wb") as handle:
+        for row in safe_rows:
+            handle.write(bytes(row["_absolute_folder_bytes"]) + b"\0")
+    return {
+        "safe": len(safe_rows),
+        "blocked": len(blocked_rows),
+        "simple_rows": simple_rows,
+        "pdf_size_units": unit_info,
+    }
+
+
+def command_deletable_folders(args: argparse.Namespace) -> int:
+    db_path = Path(args.db).expanduser().resolve()
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    tolerance_percent = float(
+        getattr(args, "simple_size_tolerance_percent", 0.1)
+    )
+    tolerance_bytes = int(
+        getattr(args, "simple_size_tolerance_bytes", 10485760)
+    )
+    if not math.isfinite(tolerance_percent) or tolerance_percent < 0:
+        raise ValueError("--simple-size-tolerance-percent must be finite and non-negative")
+    if tolerance_bytes < 0:
+        raise ValueError("--simple-size-tolerance-bytes must be non-negative")
+    with connect_db_readonly(db_path) as connection:
+        ensure_report_output_outside_stored_roots(connection, out_dir)
+        lto_count = connection.execute("SELECT COUNT(*) FROM lto_entries").fetchone()[0]
+        storage_count = connection.execute("SELECT COUNT(*) FROM storage_entries").fetchone()[0]
+        if not lto_count:
+            raise RuntimeError("Database has no LTO entries. Run extract first.")
+        if not storage_count:
+            raise RuntimeError("Database has no storage entries. Run scan first.")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        unit_info = read_pdf_size_unit_info(connection)
+        summary = write_deletable_folder_reports(
+            connection,
+            out_dir,
+            pdf_size_units=unit_info,
+            simple_size_tolerance_percent=tolerance_percent,
+            simple_size_tolerance_bytes=tolerance_bytes,
+        )
+    print_simple_folder_table(
+        summary["simple_rows"],
+        pdf_size_units=summary["pdf_size_units"],
+        tolerance_percent=tolerance_percent,
+        tolerance_bytes=tolerance_bytes,
+    )
+    eprint(
+        f"[deletable-folders] safe={summary['safe']:,}, "
+        f"blocked={summary['blocked']:,}, reports={out_dir}"
+    )
+    return 0
+
+
 def command_compare(args: argparse.Namespace) -> int:
     db_path = Path(args.db).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
     if not db_path.is_file():
         raise FileNotFoundError(f"Audit database not found: {db_path}")
-    out_dir.mkdir(parents=True, exist_ok=True)
     with connect_db(db_path) as connection:
+        ensure_report_output_outside_stored_roots(connection, out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
         lto_count = connection.execute("SELECT COUNT(*) FROM lto_entries").fetchone()[0]
         storage_count = connection.execute("SELECT COUNT(*) FROM storage_entries").fetchone()[0]
         if not lto_count:
@@ -1745,6 +2957,7 @@ def command_compare(args: argparse.Namespace) -> int:
     for key in [
         "MATCH",
         "MATCH_PATH_ONLY_SIZE_UNKNOWN",
+        "AMBIGUOUS_LTO_SIZE_UNKNOWN",
         "SIZE_MISMATCH",
         "MISSING_ON_LTO",
         "MISSING_ON_STORAGE",
@@ -1755,6 +2968,7 @@ def command_compare(args: argparse.Namespace) -> int:
         "ZERO_SIZE_LTO_ONLY",
         "ZERO_SIZE_LTO_RECORD",
         "AMBIGUOUS_STORAGE_DUPLICATE_SIZES",
+        "CONFLICTING_LTO_ENTRIES",
         "INVALID_FILESYSTEM_ENCODING",
     ]:
         if key in summary:
@@ -1769,7 +2983,12 @@ def command_all(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     db_path = out_dir / "audit.sqlite3"
 
-    extract_args = argparse.Namespace(pdf=args.pdf, db=str(db_path), append=False)
+    extract_args = argparse.Namespace(
+        pdf=args.pdf,
+        db=str(db_path),
+        append=False,
+        pdf_size_units=args.pdf_size_units,
+    )
     command_extract(extract_args)
 
     scan_args = argparse.Namespace(
@@ -1793,7 +3012,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Compare YoYotta PDF manifests with Linux storage by case-insensitive "
-            "relative path and rounded binary file size."
+            "relative path and rounded PDF file size."
         )
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1806,6 +3025,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--append",
         action="store_true",
         help="Append reports instead of replacing existing LTO data",
+    )
+    extract.add_argument(
+        "--pdf-size-units",
+        choices=sorted(PDF_SIZE_UNIT_TABLES),
+        default="decimal",
+        help="Interpret YoYotta KB/MB/GB/TB as decimal or binary (default: decimal)",
     )
     extract.set_defaults(func=command_extract)
 
@@ -1841,10 +3066,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.set_defaults(func=command_compare)
 
+    deletable = subparsers.add_parser(
+        "deletable-folders",
+        help="Report top-level storage folders fully represented on LTO",
+    )
+    deletable.add_argument("--db", required=True, help="Existing SQLite audit database")
+    deletable.add_argument(
+        "--out-dir", required=True, help="Directory for folder safety reports"
+    )
+    deletable.add_argument(
+        "--simple-size-tolerance-percent",
+        type=float,
+        default=0.1,
+        help="Relaxed percent tolerance for simple folder check (default: 0.1)",
+    )
+    deletable.add_argument(
+        "--simple-size-tolerance-bytes",
+        type=int,
+        default=10485760,
+        help="Relaxed byte tolerance for simple folder check (default: 10485760)",
+    )
+    deletable.set_defaults(func=command_deletable_folders)
+
     all_cmd = subparsers.add_parser("all", help="Extract, scan and compare in one run")
     all_cmd.add_argument("--pdf", nargs="+", required=True, help="YoYotta PDF report(s)")
     all_cmd.add_argument("--root", nargs="+", required=True, help="Read-only source roots")
     all_cmd.add_argument("--out-dir", required=True, help="Output directory (not under roots)")
+    all_cmd.add_argument(
+        "--pdf-size-units",
+        choices=sorted(PDF_SIZE_UNIT_TABLES),
+        default="decimal",
+        help="Interpret YoYotta KB/MB/GB/TB as decimal or binary (default: decimal)",
+    )
     all_cmd.add_argument(
         "--allow-rw-source",
         action="store_true",

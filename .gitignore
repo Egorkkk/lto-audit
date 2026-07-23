@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+*.pdf
+*.sqlite3
+*.db
+
+output/
+reports/
+real-data/
+test-runs/
+
+*.csv
+*.nul
