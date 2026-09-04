@@ -3,14 +3,81 @@ import csv
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 import lto_audit
+
+
+def write_test_xlsx(path, sheets):
+    def escaped(value):
+        return (
+            str(value)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    workbook_sheets = []
+    relationships = []
+    overrides = []
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, (sheet_name, rows) in enumerate(sheets, start=1):
+            workbook_sheets.append(
+                f'<sheet name="{escaped(sheet_name)}" sheetId="{index}" r:id="rId{index}"/>'
+            )
+            relationships.append(
+                f'<Relationship Id="rId{index}" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+                f'Target="worksheets/sheet{index}.xml"/>'
+            )
+            overrides.append(
+                f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+                'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            )
+            xml_rows = []
+            for row_number, values in enumerate(rows, start=1):
+                cells = []
+                for column, value in sorted(values.items()):
+                    cells.append(
+                        f'<c r="{column}{row_number}" t="inlineStr"><is><t>'
+                        f'{escaped(value)}</t></is></c>'
+                    )
+                xml_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+            archive.writestr(
+                f"xl/worksheets/sheet{index}.xml",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f'<sheetData>{"".join(xml_rows)}</sheetData></worksheet>',
+            )
+        archive.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f'<sheets>{"".join(workbook_sheets)}</sheets></workbook>',
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'{"".join(relationships)}</Relationships>',
+        )
+        archive.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/xl/workbook.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            f'{"".join(overrides)}</Types>',
+        )
 
 
 def storage(root: str, relative: str, size: int, *, valid: int = 1) -> lto_audit.StorageEntry:
@@ -241,6 +308,637 @@ class SafetyHelperTests(unittest.TestCase):
                 lto_audit.ensure_report_output_outside_stored_roots(
                     connection, root / "reports"
                 )
+
+
+class CentralInventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def scan_snapshot(
+        self,
+        *,
+        server="videoserver05",
+        server_ip="192.168.137.96",
+        volume="VIDEO6",
+        root=None,
+        output=None,
+        snapshot_id="snapshot-1",
+    ):
+        root = root or (self.base / volume)
+        output = output or (self.base / f"{snapshot_id}.sqlite3")
+        result = lto_audit.command_scan_storage(
+            argparse.Namespace(
+                server=server,
+                server_ip=server_ip,
+                volume=volume,
+                root=str(root),
+                output=str(output),
+                snapshot_id=snapshot_id,
+                allow_rw_source=True,
+                progress_every=0,
+                quiet=True,
+            )
+        )
+        self.assertEqual(result, 0)
+        return output
+
+    def test_central_schema_version_and_legacy_rows_are_preserved(self):
+        db_path = self.base / "central.sqlite3"
+        connection = sqlite3.connect(str(db_path))
+        connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("INSERT INTO metadata VALUES ('legacy', 'kept')")
+        connection.commit()
+        connection.close()
+        result = lto_audit.command_init_db(argparse.Namespace(db=str(db_path)))
+        self.assertEqual(result, 0)
+        connection = sqlite3.connect(str(db_path))
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            legacy = connection.execute(
+                "SELECT value FROM metadata WHERE key='legacy'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(version, lto_audit.CENTRAL_SCHEMA_VERSION)
+        self.assertTrue(
+            {
+                "servers",
+                "volumes",
+                "storage_scans",
+                "storage_files",
+                "archive_catalog_files",
+                "archive_manual_map",
+            }.issubset(tables)
+        )
+        self.assertEqual(legacy, "kept")
+
+    def test_scan_storage_rejects_remote_filesystem_types(self):
+        root = self.base / "VIDEO6"
+        root.mkdir()
+        with mock.patch.object(
+            lto_audit, "mount_filesystem_type_for", return_value="cifs"
+        ):
+            with self.assertRaises(RuntimeError):
+                self.scan_snapshot(root=root)
+
+    def test_scan_storage_preserves_server_volume_raw_paths_and_ignores_symlink(self):
+        root = self.base / "VIDEO6"
+        regular = root / "PROJECT" / "SOURCE" / "file.mov"
+        regular.parent.mkdir(parents=True)
+        regular.write_bytes(b"12345")
+        raw_dir = os.fsencode(str(root / "PROJECT"))
+        raw_name = raw_dir + b"/bad-\xff.mov"
+        descriptor = os.open(raw_name, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.write(descriptor, b"xx")
+        os.close(descriptor)
+        os.symlink(regular, root / "PROJECT" / "link.mov")
+        snapshot = self.scan_snapshot(root=root)
+        connection = sqlite3.connect(str(snapshot))
+        connection.row_factory = sqlite3.Row
+        try:
+            metadata = dict(connection.execute("SELECT key, value FROM snapshot_metadata"))
+            rows = connection.execute(
+                "SELECT * FROM snapshot_files ORDER BY relative_path_bytes"
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(metadata["server_hostname"], "videoserver05")
+        self.assertEqual(metadata["volume_name"], "VIDEO6")
+        self.assertEqual(metadata["status"], "COMPLETE")
+        self.assertEqual(len(rows), 2)
+        bad = [row for row in rows if not row["path_encoding_valid"]][0]
+        self.assertEqual(bytes(bad["relative_path_bytes"]), b"PROJECT/bad-\xff.mov")
+        self.assertTrue(bad["norm_path"].startswith("__NON_UTF8_RAW_BYTES__/"))
+        self.assertFalse(any(row["filename"] == "link.mov" for row in rows))
+
+    def test_snapshot_import_is_idempotent_and_same_paths_on_servers_stay_distinct(self):
+        snapshots = []
+        for server, ip, volume, snapshot_id in (
+            ("videoserver00", "192.168.137.89", "VIDEO10", "scan-10"),
+            ("videoserver05", "192.168.137.96", "VIDEO6", "scan-6"),
+        ):
+            root = self.base / server / volume
+            file_path = root / "PROJECT" / "same.mov"
+            file_path.parent.mkdir(parents=True)
+            file_path.write_bytes(b"same")
+            snapshots.append(
+                self.scan_snapshot(
+                    server=server,
+                    server_ip=ip,
+                    volume=volume,
+                    root=root,
+                    output=self.base / f"{snapshot_id}.sqlite3",
+                    snapshot_id=snapshot_id,
+                )
+            )
+        central = self.base / "central.sqlite3"
+        args = argparse.Namespace(
+            db=str(central), snapshot=[str(path) for path in snapshots]
+        )
+        self.assertEqual(lto_audit.command_import_storage_scan(args), 0)
+        self.assertEqual(lto_audit.command_import_storage_scan(args), 0)
+        connection = sqlite3.connect(str(central))
+        try:
+            counts = tuple(
+                connection.execute(
+                    "SELECT (SELECT COUNT(*) FROM servers), "
+                    "(SELECT COUNT(*) FROM volumes), "
+                    "(SELECT COUNT(*) FROM storage_scans), "
+                    "(SELECT COUNT(*) FROM storage_files)"
+                ).fetchone()
+            )
+            identities = connection.execute(
+                """
+                SELECT s.hostname, v.name, f.relative_path, f.size_bytes
+                FROM storage_files f
+                JOIN servers s ON s.id=f.server_id
+                JOIN volumes v ON v.id=f.volume_id
+                ORDER BY s.hostname, v.name
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(counts, (2, 2, 2, 2))
+        self.assertEqual({row[0] for row in identities}, {"videoserver00", "videoserver05"})
+        self.assertTrue(all(row[2] == "PROJECT/same.mov" for row in identities))
+
+    def test_reused_snapshot_identity_with_changed_metadata_is_rejected(self):
+        root = self.base / "VIDEO6"
+        root.mkdir()
+        (root / "file.mov").write_bytes(b"x")
+        snapshot = self.scan_snapshot(root=root)
+        central = self.base / "central.sqlite3"
+        args = argparse.Namespace(db=str(central), snapshot=[str(snapshot)])
+        lto_audit.command_import_storage_scan(args)
+        connection = sqlite3.connect(str(snapshot))
+        connection.execute(
+            "UPDATE snapshot_metadata SET value='192.168.137.1' "
+            "WHERE key='server_ip'"
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaises(RuntimeError):
+            lto_audit.command_import_storage_scan(args)
+        connection = sqlite3.connect(str(central))
+        try:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM storage_scans").fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_reused_snapshot_identity_with_changed_file_rows_is_rejected(self):
+        root = self.base / "VIDEO6"
+        root.mkdir()
+        (root / "file.mov").write_bytes(b"x")
+        snapshot = self.scan_snapshot(root=root)
+        central = self.base / "central.sqlite3"
+        args = argparse.Namespace(db=str(central), snapshot=[str(snapshot)])
+        lto_audit.command_import_storage_scan(args)
+        connection = sqlite3.connect(str(snapshot))
+        connection.execute(
+            "UPDATE snapshot_files SET norm_filename='changed.mov'"
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaises(RuntimeError):
+            lto_audit.command_import_storage_scan(args)
+        connection = sqlite3.connect(str(central))
+        try:
+            stored = connection.execute(
+                "SELECT norm_filename FROM storage_files"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(stored, "file.mov")
+
+
+class ArchiveImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.db_path = self.base / "central.sqlite3"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_cassette_normalization_uses_only_unambiguous_generation_suffix(self):
+        self.assertEqual(lto_audit.normalize_cassette_label("FF7480L7"), "ff7480")
+        self.assertEqual(lto_audit.normalize_cassette_label(" CTH342L7 "), "cth342")
+        self.assertEqual(lto_audit.normalize_cassette_label("OV6319L7"), "ov6319")
+        self.assertEqual(lto_audit.normalize_cassette_label("CXZ305"), "cxz305")
+        self.assertEqual(lto_audit.normalize_cassette_label("OV63118"), "ov63118")
+        self.assertEqual(lto_audit.normalize_cassette_label("KANSK05"), "kansk05")
+
+    def test_per_file_catalog_parser_preserves_source_fields_and_is_idempotent(self):
+        workbook = self.base / "MC2 - LTO Backups.xlsx"
+        write_test_xlsx(
+            workbook,
+            [
+                (
+                    "KANSK",
+                    [
+                        {"A": "Column1", "B": "Column2", "C": "Column3", "D": "Column4"},
+                        {
+                            "A": "Project Name",
+                            "B": "Cassette Label",
+                            "C": "Path",
+                            "D": "Filename",
+                        },
+                        {
+                            "A": "KANSK",
+                            "B": "CTH343L7",
+                            "C": "/26-11-2024/cam a",
+                            "D": "A001.MXF",
+                        },
+                        {
+                            "A": "LOBANOVA",
+                            "B": "CXZ336L7",
+                            "C": "/mnt/ltfs2/old path",
+                            "D": "same.wav",
+                        },
+                    ],
+                ),
+                ("Sheet1", []),
+            ],
+        )
+        args = argparse.Namespace(file=str(workbook), db=str(self.db_path))
+        self.assertEqual(lto_audit.command_import_archive_catalog(args), 0)
+        self.assertEqual(lto_audit.command_import_archive_catalog(args), 0)
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT * FROM archive_catalog_files ORDER BY source_sheet, source_row"
+            ).fetchall()
+            imports = connection.execute(
+                "SELECT row_count FROM archive_imports"
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(imports), 1)
+        self.assertEqual(imports[0][0], 2)
+        self.assertEqual(rows[0]["source_row"], 3)
+        self.assertEqual(rows[0]["cassette_raw"], "CTH343L7")
+        self.assertEqual(rows[0]["cassette_norm"], "cth343")
+        self.assertEqual(rows[0]["path_norm"], "26-11-2024/cam a")
+        self.assertEqual(rows[1]["path_raw"], "/mnt/ltfs2/old path")
+
+    def test_manual_catalog_understands_alias_row_and_direct_folder_row(self):
+        workbook = self.base / "LTO_BACKUPS_MC.xlsx"
+        write_test_xlsx(
+            workbook,
+            [
+                (
+                    "KANSK",
+                    [
+                        {"A": "CTH343", "B": "CTH344"},
+                        {"A": "KANSK05", "B": "KANSK06"},
+                        {"A": "26112024", "B": "30112024"},
+                        {"A": "PROXY", "B": "ОШИБКА"},
+                    ],
+                ),
+                (
+                    "VU2",
+                    [
+                        {"A": "FF2000L7", "B": "FF2001"},
+                        {"A": "20240611\\", "B": "20240615\\"},
+                        {"A": "20240612\\", "B": "20240618\\"},
+                    ],
+                ),
+            ],
+        )
+        args = argparse.Namespace(file=str(workbook), db=str(self.db_path))
+        self.assertEqual(lto_audit.command_import_manual_catalog(args), 0)
+        self.assertEqual(lto_audit.command_import_manual_catalog(args), 0)
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT * FROM archive_manual_map ORDER BY source_sheet, source_row, source_column"
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(len(rows), 8)
+        kansk = [row for row in rows if row["source_sheet"] == "KANSK"]
+        vu2 = [row for row in rows if row["source_sheet"] == "VU2"]
+        self.assertTrue(all(row["cassette_note_raw"].startswith("KANSK") for row in kansk))
+        self.assertEqual({row["source_row"] for row in kansk}, {3, 4})
+        self.assertEqual({row["source_row"] for row in vu2}, {2, 3})
+        self.assertEqual(vu2[0]["cassette_raw"], "FF2000L7")
+        self.assertEqual(vu2[0]["cassette_norm"], "ff2000")
+        self.assertEqual(vu2[0]["folder_path_norm"], "20240611")
+        self.assertIn("ОШИБКА", {row["folder_path_raw"] for row in rows})
+
+
+class DiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.raid = self.base / "VIDEO6_RO"
+        self.raid.mkdir()
+        self.db_path = self.base / "audit.sqlite3"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def source(self, project):
+        path = self.raid / project / "SOURCE"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def physical_file(self, source, relative, size):
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+        return path
+
+    def create_lto_db(self, entries):
+        connection = lto_audit.connect_db(self.db_path)
+        try:
+            lto_audit.insert_lto_data(
+                connection,
+                entries,
+                [],
+                {
+                    "source_pdf": "discovery.pdf",
+                    "project": "mixed",
+                    "expected_files": len(entries),
+                    "extracted_files": len(entries),
+                    "difference": 0,
+                    "sequence_files": sum(bool(entry.sequence_id) for entry in entries),
+                    "size_unknown_files": sum(not entry.size_known for entry in entries),
+                    "issues": 0,
+                },
+            )
+        finally:
+            connection.close()
+
+    def run_discovery(self, name="discovery", **overrides):
+        out_dir = self.base / name
+        arguments = {
+            "db": str(self.db_path),
+            "raid_root": [str(self.raid)],
+            "out_dir": str(out_dir),
+            "max_source_depth": 2,
+            "anchors_per_folder": 5,
+            "min_anchor_matches": 2,
+            "allow_rw_source": True,
+        }
+        arguments.update(overrides)
+        terminal = io.StringIO()
+        with redirect_stdout(terminal):
+            result = lto_audit.command_discover(argparse.Namespace(**arguments))
+        self.assertEqual(result, 0)
+        self.terminal_output = terminal.getvalue()
+        return out_dir
+
+    def rows(self, out_dir, filename="discovery_mapping.csv"):
+        with (out_dir / filename).open(encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def test_scan_cli_keeps_legacy_root_input_and_accepts_mapping(self):
+        parser = lto_audit.build_parser()
+        legacy = parser.parse_args(["scan", "--root", "/one", "/two", "--db", "a.db"])
+        mapped = parser.parse_args(
+            ["scan", "--mapping", "discovery_mapping.csv", "--db", "a.db"]
+        )
+        self.assertEqual(legacy.root, ["/one", "/two"])
+        self.assertIsNone(legacy.mapping)
+        self.assertEqual(mapped.mapping, "discovery_mapping.csv")
+        self.assertIsNone(mapped.root)
+
+    def test_unique_non_date_name_is_verified_by_path_and_size_anchors(self):
+        source = self.source("PROJECT_X")
+        entries = [lto("DI/a/one.mxf", 10, 10), lto("DI/b/two.mxf", 20, 20)]
+        self.create_lto_db(entries)
+        self.physical_file(source, "DI/a/one.mxf", 10)
+        self.physical_file(source, "DI/b/two.mxf", 20)
+        row = self.rows(self.run_discovery())[0]
+        self.assertEqual(row["lto_top_folder"], "DI")
+        self.assertEqual(row["status"], "MATCHED")
+        self.assertEqual(row["project_name"], "PROJECT_X")
+        self.assertEqual(row["anchors_path_matched"], "2")
+        self.assertEqual(row["anchors_size_matched"], "2")
+
+    def test_discovery_rejects_output_inside_raid_root_before_writing(self):
+        self.source("PROJECT")
+        self.create_lto_db(
+            [lto("DI/a/one.mxf", 10, 10), lto("DI/b/two.mxf", 20, 20)]
+        )
+        out_dir = self.raid / "reports"
+        with self.assertRaises(RuntimeError):
+            lto_audit.command_discover(
+                argparse.Namespace(
+                    db=str(self.db_path),
+                    raid_root=[str(self.raid)],
+                    out_dir=str(out_dir),
+                    max_source_depth=2,
+                    anchors_per_folder=5,
+                    min_anchor_matches=2,
+                    allow_rw_source=True,
+                )
+            )
+        self.assertFalse(out_dir.exists())
+
+    def test_duplicate_name_selects_only_candidate_with_complete_relative_paths(self):
+        correct = self.source("CORRECT")
+        wrong = self.source("WRONG")
+        entries = [
+            lto("20240711/cam/a.mov", 10, 10),
+            lto("20240711/sound/a.wav", 20, 20),
+        ]
+        self.create_lto_db(entries)
+        self.physical_file(correct, "20240711/cam/a.mov", 10)
+        self.physical_file(correct, "20240711/sound/a.wav", 20)
+        # The same basenames exist, but paths and one size are wrong.
+        self.physical_file(wrong, "20240711/other/a.mov", 999)
+        self.physical_file(wrong, "20240711/elsewhere/a.wav", 20)
+        row = self.rows(self.run_discovery())[0]
+        self.assertEqual(row["status"], "MATCHED")
+        self.assertEqual(row["candidate_count"], "2")
+        self.assertEqual(row["project_name"], "CORRECT")
+
+    def test_same_exact_paths_with_wrong_size_do_not_beat_correct_candidate(self):
+        correct = self.source("CORRECT_SIZE")
+        wrong = self.source("WRONG_SIZE")
+        entries = [
+            lto("DI/a/shared.mxf", 10, 10),
+            lto("DI/b/second.mxf", 20, 20),
+        ]
+        self.create_lto_db(entries)
+        for source, first_size in ((correct, 10), (wrong, 999)):
+            self.physical_file(source, "DI/a/shared.mxf", first_size)
+            self.physical_file(source, "DI/b/second.mxf", 20)
+        row = self.rows(self.run_discovery())[0]
+        self.assertEqual(row["status"], "MATCHED")
+        self.assertEqual(row["project_name"], "CORRECT_SIZE")
+        self.assertEqual(row["candidate_count"], "2")
+
+    def test_two_candidates_with_insufficient_evidence_are_ambiguous(self):
+        first = self.source("ONE")
+        second = self.source("TWO")
+        entry = lto("PROXY/path/file.mov", 10, 10)
+        self.create_lto_db([entry])
+        self.physical_file(first, "PROXY/path/file.mov", 10)
+        self.physical_file(second, "PROXY/path/file.mov", 10)
+        out_dir = self.run_discovery()
+        row = self.rows(out_dir)[0]
+        self.assertEqual(row["status"], "AMBIGUOUS")
+        self.assertEqual(row["candidate_count"], "2")
+        self.assertEqual(len(self.rows(out_dir, "discovery_ambiguous.csv")), 1)
+
+    def test_similar_top_folder_names_are_not_conflated(self):
+        source = self.source("DATES")
+        entries = []
+        for folder in ("20240905", "20240905_2", "20240905_3"):
+            entries.extend(
+                [
+                    lto(f"{folder}/a/one.mov", 10, 10),
+                    lto(f"{folder}/b/two.mov", 20, 20),
+                ]
+            )
+            self.physical_file(source, f"{folder}/a/one.mov", 10)
+            self.physical_file(source, f"{folder}/b/two.mov", 20)
+        self.create_lto_db(entries)
+        rows = self.rows(self.run_discovery())
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(row["status"] == "MATCHED" for row in rows))
+        self.assertEqual(
+            {row["lto_top_folder"] for row in rows},
+            {"20240905", "20240905_2", "20240905_3"},
+        )
+
+    def test_fallback_anchor_search_finds_renamed_physical_folder(self):
+        source = self.source("MIXED")
+        entries = [
+            lto("LTO_NAME/a/one.mov", 10, 10),
+            lto("LTO_NAME/b/two.mov", 20, 20),
+        ]
+        self.create_lto_db(entries)
+        self.physical_file(source, "PHYSICAL_NAME/a/one.mov", 10)
+        self.physical_file(source, "PHYSICAL_NAME/b/two.mov", 20)
+        row = self.rows(self.run_discovery())[0]
+        self.assertEqual(row["status"], "MATCHED")
+        self.assertEqual(Path(row["physical_folder"]).name, "PHYSICAL_NAME")
+        self.assertIn("fallback=yes", row["confidence_reason"])
+
+    def test_not_found_and_unknown_size_records_remain_unresolved(self):
+        source = self.source("PROJECT")
+        entries = [
+            lto("UNKNOWN/a/one.mov", None, None),
+            lto("UNKNOWN/b/two.mov", None, None),
+            lto("MISSING/a/one.mov", 10, 10),
+            lto("MISSING/b/two.mov", 20, 20),
+        ]
+        self.create_lto_db(entries)
+        self.physical_file(source, "UNKNOWN/a/one.mov", 10)
+        self.physical_file(source, "UNKNOWN/b/two.mov", 20)
+        out_dir = self.run_discovery()
+        rows = {row["lto_top_folder"]: row for row in self.rows(out_dir)}
+        self.assertEqual(rows["UNKNOWN"]["status"], "NAME_MATCH_UNVERIFIED")
+        self.assertEqual(rows["UNKNOWN"]["anchors_size_matched"], "0")
+        self.assertEqual(rows["MISSING"]["status"], "NOT_FOUND")
+        self.assertEqual(len(self.rows(out_dir, "discovery_not_found.csv")), 1)
+        self.assertIn("UNVERIFIED: 1", self.terminal_output)
+        self.assertIn("NOT_FOUND: 1", self.terminal_output)
+
+    def test_identical_tape_duplicates_do_not_multiply_anchor_evidence(self):
+        source = self.source("PROJECT")
+        first = lto("DI/a/one.mov", 10, 10, tape="T1")
+        duplicate = lto("DI/a/one.mov", 10, 10, tape="T2")
+        self.create_lto_db([first, duplicate])
+        self.physical_file(source, "DI/a/one.mov", 10)
+        row = self.rows(self.run_discovery())[0]
+        self.assertEqual(row["anchors_tested"], "1")
+        self.assertEqual(row["anchors_size_matched"], "1")
+        self.assertEqual(row["status"], "NAME_MATCH_UNVERIFIED")
+
+    def test_discovery_does_not_modify_source_and_mapping_scans_only_matched(self):
+        source = self.source("PROJECT")
+        entries = [
+            lto("LOGICAL/a/one.mov", 10, 10),
+            lto("LOGICAL/b/two.mov", 20, 20),
+            lto("ABSENT/c/three.mov", 1, 1),
+            lto("ABSENT/d/four.mov", 2, 2),
+        ]
+        self.create_lto_db(entries)
+        first = self.physical_file(source, "PHYSICAL/a/one.mov", 10)
+        second = self.physical_file(source, "PHYSICAL/b/two.mov", 20)
+        before = {
+            path.relative_to(self.raid).as_posix(): (
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+                hashlib.sha256(path.read_bytes()).digest(),
+            )
+            for path in (first, second)
+        }
+        database_before = hashlib.sha256(self.db_path.read_bytes()).digest()
+        database_files_before = sorted(self.base.glob(self.db_path.name + "*"))
+        out_dir = self.run_discovery()
+        after = {
+            path.relative_to(self.raid).as_posix(): (
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+                hashlib.sha256(path.read_bytes()).digest(),
+            )
+            for path in (first, second)
+        }
+        self.assertEqual(before, after)
+        self.assertEqual(
+            database_before, hashlib.sha256(self.db_path.read_bytes()).digest()
+        )
+        self.assertEqual(
+            database_files_before, sorted(self.base.glob(self.db_path.name + "*"))
+        )
+        mapping_path = out_dir / "discovery_mapping.csv"
+        result = lto_audit.command_scan(
+            argparse.Namespace(
+                root=None,
+                mapping=str(mapping_path),
+                db=str(self.db_path),
+                allow_rw_source=True,
+                progress_every=0,
+                quiet=True,
+            )
+        )
+        self.assertEqual(result, 0)
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            scanned = connection.execute(
+                "SELECT source_root, absolute_path, relative_path, relative_path_bytes "
+                "FROM storage_entries ORDER BY relative_path"
+            ).fetchall()
+            audits = lto_audit.build_folder_audits(connection)
+        finally:
+            connection.close()
+        self.assertEqual(len(scanned), 2)
+        self.assertTrue(all(row["source_root"] == str(source) for row in scanned))
+        self.assertEqual(
+            [row["relative_path"] for row in scanned],
+            ["LOGICAL/a/one.mov", "LOGICAL/b/two.mov"],
+        )
+        self.assertTrue(all("PHYSICAL" in row["absolute_path"] for row in scanned))
+        self.assertTrue(
+            all(bytes(row["relative_path_bytes"]).startswith(b"PHYSICAL/") for row in scanned)
+        )
+        self.assertEqual(len(audits), 1)
+        strict_row = lto_audit.folder_report_row(audits[0])
+        self.assertEqual(strict_row["decision"], "SAFE_TO_DELETE")
+        self.assertEqual(strict_row["absolute_path"], str(source / "PHYSICAL"))
 
 
 class DeletableFoldersTests(unittest.TestCase):

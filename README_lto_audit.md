@@ -53,6 +53,111 @@ python -m pip install -r requirements-lto-audit.txt
 
 Если PyMuPDF не установлен, скрипт попробует использовать системный `pdftotext` из `poppler-utils`.
 
+## Центральная inventory database
+
+Новый основной workflow отделяет одноразовый локальный scan RAID от последующей
+работы с LTO-манифестами. Central process не обходит RAID по SMB/NFS: каждый
+snapshot создаётся непосредственно на storage-server и затем переносится на
+центральную машину.
+
+### 1. Создать или мигрировать central DB
+
+```bash
+python lto_audit.py init-db --db ~/lto-inventory/lto_inventory.sqlite3
+```
+
+Схема имеет явную версию `PRAGMA user_version=2`. Миграция эволюционная:
+существующие `lto_entries`, `storage_entries`, metadata и audit reports не
+удаляются. Добавляются:
+
+- `servers`, `volumes`, `storage_scans`, `storage_files`;
+- `storage_scan_issues`;
+- `archive_imports`, `archive_catalog_files`, `archive_manual_map`.
+
+`storage_files` идентифицирует физическую запись через scan/server/volume и raw
+relative path. Поэтому одинаковый путь на двух серверах остаётся двумя файлами.
+Индексы добавлены только для будущих реальных lookup patterns: volume+path,
+filename+size и cassette hints.
+
+### 2. Один раз просканировать локальные volumes
+
+Команды выполняются на соответствующих storage-server, по локальным mount
+points:
+
+```bash
+# videoserver00 / 192.168.137.89
+python lto_audit.py scan-storage \
+  --server videoserver00 --server-ip 192.168.137.89 \
+  --volume VIDEO10 --root /mnt/VIDEO10 \
+  --output VIDEO10_inventory.sqlite3
+
+# videoserver02 / 192.168.137.90: повторить для VIDEO3 и VIDEO5
+# videoserver05 / 192.168.137.96: повторить для VIDEO4, VIDEO6 и VIDEO7
+```
+
+`scan-storage` обходит всё дерево volume, а не только `SOURCE`, используя
+`os.scandir` и `stat`. Содержимое файлов не читается, хеши не вычисляются,
+symlink не обходятся. Exact logical size, `mtime_ns`, normalized path и raw path
+bytes сохраняются в автономном SQLite snapshot. Source mount должен быть RO;
+SMB/CIFS/NFS/SSHFS отклоняются, потому что snapshot обязан строиться локально.
+Существующий `--allow-rw-source` разрешает только осознанное тестирование на
+writable local filesystem и не разрешает remote filesystem.
+
+Готовый snapshot имеет собственный `snapshot_id` и schema version 1. Уже
+существующий `--output` не перезаписывается.
+
+### 3. Импортировать snapshots
+
+После копирования snapshot-файлов на центральную машину:
+
+```bash
+python lto_audit.py import-storage-scan \
+  --snapshot VIDEO10_inventory.sqlite3 VIDEO3_inventory.sqlite3 \
+             VIDEO5_inventory.sqlite3 VIDEO4_inventory.sqlite3 \
+             VIDEO6_inventory.sqlite3 VIDEO7_inventory.sqlite3 \
+  --db ~/lto-inventory/lto_inventory.sqlite3
+```
+
+Каждый snapshot импортируется транзакционно. Повтор того же `snapshot_id` с той
+же identity возвращает `ALREADY_IMPORTED` и не создаёт дубликаты. Тот же ID с
+другим server/IP/volume/root или другими итоговыми counters считается
+конфликтом. При идемпотентном повторе также построчно сверяются metadata файлов
+и scan issues, поэтому подмена содержимого snapshot при сохранённом ID не
+принимается молча.
+
+### 4. Один раз импортировать исторические XLSX
+
+```bash
+python lto_audit.py import-archive-catalog \
+  --file "MC2 - LTO Backups.xlsx" \
+  --db ~/lto-inventory/lto_inventory.sqlite3
+
+python lto_audit.py import-manual-catalog \
+  --file LTO_BACKUPS_MC.xlsx \
+  --db ~/lto-inventory/lto_inventory.sqlite3
+```
+
+Первый importer потоково читает фактическую четырёхколоночную пофайловую
+структуру и сохраняет project/cassette/path/filename вместе с workbook, sheet и
+row. Второй читает column-oriented ручную карту: sheet является project hint,
+row 1 содержит cassette, optional row 2 — tape/project note, остальные cells —
+исходный folder/path text. Служебный и ошибочный текст не отбрасывается.
+
+Обе книги читаются напрямую как OOXML стандартной библиотекой; worksheets не
+загружаются целиком. Повтор неизменённого файла идемпотентен. Изменение уже
+импортированного workbook на том же пути считается конфликтом.
+
+Cassette labels нормализуются отдельным консервативным правилом: однозначный
+generation suffix (`FF7480L7` → `ff7480`, `CTH342L7` → `cth342`) удаляется, но
+исходная строка сохраняется. Неизвестные форматы не угадываются.
+
+Проверка реальных файлов дала 403858 строк `archive_catalog_files` и 458 строк
+`archive_manual_map`.
+
+Следующие этапы central workflow — безопасный incremental `import-pdf`, а затем
+database-only matcher. Они намеренно не объединены с inventory import: до
+matcher RAID больше не должен сканироваться.
+
 ## Рекомендуемое RO bind-монтирование
 
 Пример для двух массивов:
@@ -129,7 +234,77 @@ python lto_audit.py extract \
   --db ~/lto-audit/KANSK/audit.sqlite3
 ```
 
-### 2. Просканировать массивы
+### 2. Найти проекты и сопоставить папки LTO
+
+Если один PDF содержит верхние папки из разных проектов, после `extract` можно
+выполнить read-only discovery по корням RAID:
+
+```bash
+python lto_audit.py discover \
+  --db ~/lto-audit/MIXED/audit.sqlite3 \
+  --raid-root /mnt/VIDEO6_RO \
+  --raid-root /mnt/VIDEO7_RO \
+  --raid-root /mnt/VIDEO8_RO \
+  --out-dir ~/lto-audit/MIXED/discovery
+```
+
+Команда не разбирает PDF повторно и не меняет SQLite. Она открывает готовую базу
+через `mode=ro&immutable=1`, ищет каталоги `<RAID>/<project>/SOURCE` и проверяет
+верхние физические папки несколькими точными относительными путями из
+`lto_entries`. Для известных размеров также используется сохранённый интервал
+округления YoYotta. Имена сравниваются без учёта регистра с NFC-нормализацией.
+Формат даты не предполагается, поэтому `DI`, `PROXY`, `20240905_3` и другие
+произвольные имена обрабатываются одинаково.
+
+По умолчанию `SOURCE` ищется не глубже двух компонентов от RAID-корня. Предел
+можно изменить через `--max-source-depth`. Для папки выбирается до пяти anchors
+(`--anchors-per-folder`), распределённых по разным подкаталогам; статус
+`MATCHED` требует минимум два известных path+size совпадения
+(`--min-anchor-matches`). Одинаковый LTO-путь на нескольких кассетах считается
+одним доказательством. Записи последовательностей с неизвестным индивидуальным
+размером могут подтвердить существование пути, но сами по себе никогда не дают
+`MATCHED`.
+
+Сначала проверяются только одноимённые папки непосредственно под найденными
+`SOURCE`. Если их нет, выполняется дешёвый fallback: для верхних папок проверяются
+выбранные точные подпути. Полный рекурсивный scan всех RAID при discovery не
+выполняется, содержимое медиафайлов не читается, хеши не вычисляются, symlink не
+используются. Fallback использует только подпути, отличающие данную верхнюю
+LTO-папку от других папок того же манифеста.
+
+Результаты:
+
+- `MATCHED` — ровно один кандидат подтверждён несколькими точными anchors и
+  известными размерами;
+- `AMBIGUOUS` — правдоподобных кандидатов несколько;
+- `NAME_MATCH_UNVERIFIED` — кандидат найден, но известных доказательств
+  недостаточно;
+- `NOT_FOUND` — ни одно безопасное соответствие не найдено.
+
+Создаются `discovery_mapping.csv`, `discovery_ambiguous.csv` (неоднозначные и
+непроверенные строки) и `discovery_not_found.csv`. Основной CSV содержит LTO-имя и его нормализованный
+ключ, RAID, проект, каталог `SOURCE`, физическую папку, число кандидатов,
+счётчики path/size anchors и детерминированную причину уверенности. Каталог
+`--out-dir` обязан находиться вне всех переданных RAID-корней. RAID-монтирования
+проверяются существующим механизмом `findmnt` и должны иметь `ro`.
+
+Пример терминала:
+
+```text
+LTO folder  Project     Physical folder                                  Status
+----------  ----------  -----------------------------------------------  ---------
+20240711    MESTO_SILY  /mnt/VIDEO6_RO/MESTO_SILY/SOURCE/20240711        MATCHED
+DI          PROJECT_X   /mnt/VIDEO7_RO/PROJECT_X/SOURCE/DI                MATCHED
+20240905    ?           -                                                AMBIGUOUS
+OTHER       ?           -                                                NOT_FOUND
+
+MATCHED: 2
+AMBIGUOUS: 1
+NOT_FOUND: 1
+UNVERIFIED: 0
+```
+
+### 3. Просканировать массивы
 
 ```bash
 python lto_audit.py scan \
@@ -137,7 +312,25 @@ python lto_audit.py scan \
   --db ~/lto-audit/KANSK/audit.sqlite3
 ```
 
-### 3. Выполнить сравнение
+Старый `scan --root ...` полностью сохранён. Чтобы сканировать только безопасно
+сопоставленные discovery-папки, вместо `--root` передайте основной mapping:
+
+```bash
+python lto_audit.py scan \
+  --mapping ~/lto-audit/MIXED/discovery/discovery_mapping.csv \
+  --db ~/lto-audit/MIXED/audit.sqlite3
+```
+
+Scanner принимает исключительно строки `MATCHED`; `AMBIGUOUS`, `NOT_FOUND` и
+`NAME_MATCH_UNVERIFIED` пропускаются. Каждая физическая папка сканируется
+отдельно, но в `norm_path` подставляется её LTO top-folder identity, поэтому
+существующая строгая логика сравнения остаётся без изменений. `source_root`
+сохраняет настоящий каталог проекта `SOURCE`, `absolute_path` — настоящий путь
+файла, а raw bytes относительного пути — физическое имя папки. Это сохраняет
+различие проектов и корректный физический путь даже при fallback с другим
+именем папки.
+
+### 4. Выполнить сравнение
 
 ```bash
 python lto_audit.py compare \
@@ -145,7 +338,7 @@ python lto_audit.py compare \
   --out-dir ~/lto-audit/KANSK/reports
 ```
 
-### 4. Найти полностью представленные на LTO верхние папки
+### 5. Найти полностью представленные на LTO верхние папки
 
 ```bash
 python lto_audit.py deletable-folders \

@@ -29,6 +29,9 @@ import sqlite3
 import subprocess
 import sys
 import unicodedata
+import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
@@ -36,7 +39,9 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-VERSION = "1.3.0"
+VERSION = "1.5.0"
+CENTRAL_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 1
 
 BINARY_UNITS = {
     "B": 1,
@@ -186,6 +191,47 @@ class SimpleFolderEvaluation:
     scan_issue_count: int
     invalid_encoding_count: int
     aggregate_size_result: str
+
+
+@dataclass(frozen=True)
+class DiscoveryAnchor:
+    relative_below_top: str
+    norm_path: str
+    filename: str
+    size_min_bytes: Optional[int]
+    size_max_bytes: Optional[int]
+    size_known: bool
+    distinctive_below_top: bool
+
+
+@dataclass(frozen=True)
+class SourceDirectory:
+    raid_root: Path
+    project_name: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class DiscoveryCandidate:
+    source: SourceDirectory
+    physical_folder: Path
+
+
+@dataclass(frozen=True)
+class DiscoveryCandidateScore:
+    candidate: DiscoveryCandidate
+    anchors_tested: int
+    anchors_path_matched: int
+    anchors_size_matched: int
+    anchors_size_mismatched: int
+    unknown_size_paths_matched: int
+
+
+@dataclass(frozen=True)
+class MappedScanRoot:
+    source_directory: Path
+    physical_folder: Path
+    lto_top_folder: str
 
 
 def eprint(*args: object, **kwargs: object) -> None:
@@ -673,6 +719,7 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(db_path))
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA temp_store=MEMORY")
@@ -704,6 +751,12 @@ def connect_db_readonly(db_path: Path) -> sqlite3.Connection:
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
+    current_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if current_version > CENTRAL_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema version {current_version} is newer than supported "
+            f"version {CENTRAL_SCHEMA_VERSION}."
+        )
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS metadata (
@@ -786,6 +839,125 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             issue_type TEXT NOT NULL,
             details TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS servers (
+            id INTEGER PRIMARY KEY,
+            hostname TEXT NOT NULL UNIQUE,
+            ip_address TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS volumes (
+            id INTEGER PRIMARY KEY,
+            server_id INTEGER NOT NULL REFERENCES servers(id),
+            name TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(server_id, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS storage_scans (
+            id INTEGER PRIMARY KEY,
+            snapshot_id TEXT NOT NULL UNIQUE,
+            server_id INTEGER NOT NULL REFERENCES servers(id),
+            volume_id INTEGER NOT NULL REFERENCES volumes(id),
+            source_root TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            file_count INTEGER NOT NULL,
+            total_size_bytes INTEGER NOT NULL,
+            issue_count INTEGER NOT NULL,
+            snapshot_schema_version INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS storage_files (
+            id INTEGER PRIMARY KEY,
+            scan_id INTEGER NOT NULL REFERENCES storage_scans(id),
+            server_id INTEGER NOT NULL REFERENCES servers(id),
+            volume_id INTEGER NOT NULL REFERENCES volumes(id),
+            absolute_path TEXT NOT NULL,
+            absolute_path_bytes BLOB NOT NULL,
+            relative_path TEXT NOT NULL,
+            relative_path_bytes BLOB NOT NULL,
+            path_encoding_valid INTEGER NOT NULL,
+            project_folder TEXT NOT NULL,
+            norm_project_folder TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            norm_filename TEXT NOT NULL,
+            norm_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            UNIQUE(scan_id, relative_path_bytes)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_storage_files_volume_norm_path
+            ON storage_files(volume_id, norm_path);
+        CREATE INDEX IF NOT EXISTS idx_storage_files_norm_filename_size
+            ON storage_files(norm_filename, size_bytes);
+
+        CREATE TABLE IF NOT EXISTS storage_scan_issues (
+            id INTEGER PRIMARY KEY,
+            scan_id INTEGER NOT NULL REFERENCES storage_scans(id),
+            path TEXT NOT NULL,
+            issue_type TEXT NOT NULL,
+            details TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS archive_imports (
+            id INTEGER PRIMARY KEY,
+            source_kind TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            imported_at TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            UNIQUE(source_kind, source_path)
+        );
+
+        CREATE TABLE IF NOT EXISTS archive_catalog_files (
+            id INTEGER PRIMARY KEY,
+            import_id INTEGER NOT NULL REFERENCES archive_imports(id),
+            source_workbook TEXT NOT NULL,
+            source_sheet TEXT NOT NULL,
+            source_row INTEGER NOT NULL,
+            project_raw TEXT NOT NULL,
+            project_norm TEXT NOT NULL,
+            cassette_raw TEXT NOT NULL,
+            cassette_norm TEXT NOT NULL,
+            path_raw TEXT NOT NULL,
+            path_norm TEXT NOT NULL,
+            filename_raw TEXT NOT NULL,
+            filename_norm TEXT NOT NULL,
+            size_raw TEXT NOT NULL,
+            size_bytes INTEGER,
+            UNIQUE(import_id, source_sheet, source_row)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_archive_catalog_filename
+            ON archive_catalog_files(filename_norm);
+        CREATE INDEX IF NOT EXISTS idx_archive_catalog_cassette
+            ON archive_catalog_files(cassette_norm);
+
+        CREATE TABLE IF NOT EXISTS archive_manual_map (
+            id INTEGER PRIMARY KEY,
+            import_id INTEGER NOT NULL REFERENCES archive_imports(id),
+            source_workbook TEXT NOT NULL,
+            source_sheet TEXT NOT NULL,
+            source_row INTEGER NOT NULL,
+            source_column TEXT NOT NULL,
+            project_raw TEXT NOT NULL,
+            project_norm TEXT NOT NULL,
+            cassette_raw TEXT NOT NULL,
+            cassette_norm TEXT NOT NULL,
+            cassette_note_raw TEXT NOT NULL,
+            folder_path_raw TEXT NOT NULL,
+            folder_path_norm TEXT NOT NULL,
+            UNIQUE(import_id, source_sheet, source_row, source_column)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_archive_manual_cassette
+            ON archive_manual_map(cassette_norm);
         """
     )
     # Upgrade databases created by v1.0.0 in place. The scan stage replaces all
@@ -801,6 +973,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE storage_entries ADD COLUMN path_encoding_valid INTEGER NOT NULL DEFAULT 1"
         )
+    connection.execute(f"PRAGMA user_version={CENTRAL_SCHEMA_VERSION}")
     connection.commit()
 
 
@@ -1008,6 +1181,444 @@ def ensure_report_output_outside_stored_roots(
     ensure_not_nested(output_path, roots)
 
 
+DISCOVERY_FIELDNAMES = [
+    "lto_top_folder",
+    "normalized_lto_top_folder",
+    "status",
+    "raid_root",
+    "source_root",
+    "project_name",
+    "source_directory",
+    "physical_folder",
+    "candidate_count",
+    "anchors_tested",
+    "anchors_path_matched",
+    "anchors_size_matched",
+    "anchors_size_mismatched",
+    "unknown_size_paths_matched",
+    "confidence_reason",
+]
+
+
+def discover_source_directories(
+    raid_roots: Sequence[Path], *, max_depth: int
+) -> Tuple[List[SourceDirectory], List[str]]:
+    """Find SOURCE directories without following links or reading file data."""
+    if max_depth < 1:
+        raise ValueError("--max-source-depth must be at least 1")
+    found: List[SourceDirectory] = []
+    issues: List[str] = []
+    for raid_root in raid_roots:
+        stack: List[Tuple[Path, int]] = [(raid_root, 0)]
+        while stack:
+            directory, depth = stack.pop()
+            if depth >= max_depth:
+                continue
+            try:
+                with os.scandir(directory) as scan:
+                    children = list(scan)
+            except OSError as exc:
+                issues.append(f"directory_read_error:{safe_filesystem_display(str(directory))}:{exc!r}")
+                continue
+            children.sort(key=lambda item: (normalize_component(item.name), item.name))
+            for child in children:
+                if child.name.startswith("."):
+                    continue
+                try:
+                    if child.is_symlink() or not child.is_dir(follow_symlinks=False):
+                        continue
+                except OSError as exc:
+                    issues.append(
+                        f"directory_stat_error:{safe_filesystem_display(child.path)}:{exc!r}"
+                    )
+                    continue
+                child_path = Path(child.path)
+                child_depth = depth + 1
+                if normalize_component(child.name) == normalize_component("SOURCE"):
+                    found.append(
+                        SourceDirectory(
+                            raid_root=raid_root,
+                            project_name=safe_filesystem_display(directory.name),
+                            path=child_path,
+                        )
+                    )
+                    continue
+                if child_depth < max_depth:
+                    stack.append((child_path, child_depth))
+    found.sort(
+        key=lambda item: (
+            normalize_component(str(item.raid_root)),
+            normalize_component(str(item.path)),
+            str(item.path),
+        )
+    )
+    return found, issues
+
+
+def source_top_folders(
+    sources: Sequence[SourceDirectory], issues: List[str]
+) -> List[DiscoveryCandidate]:
+    candidates: List[DiscoveryCandidate] = []
+    for source in sources:
+        try:
+            with os.scandir(source.path) as scan:
+                children = list(scan)
+        except OSError as exc:
+            issues.append(
+                f"directory_read_error:{safe_filesystem_display(str(source.path))}:{exc!r}"
+            )
+            continue
+        children.sort(key=lambda item: (normalize_component(item.name), item.name))
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            try:
+                if child.is_symlink() or not child.is_dir(follow_symlinks=False):
+                    continue
+            except OSError as exc:
+                issues.append(
+                    f"directory_stat_error:{safe_filesystem_display(child.path)}:{exc!r}"
+                )
+                continue
+            candidates.append(
+                DiscoveryCandidate(source=source, physical_folder=Path(child.path))
+            )
+    return candidates
+
+
+def select_discovery_anchors(
+    entries: Sequence[LtoEntry],
+    *,
+    filename_path_counts: Dict[str, int],
+    below_top_counts: Dict[str, int],
+    maximum: int,
+) -> List[DiscoveryAnchor]:
+    """Choose deterministic, path-based anchors; repeated tape copies count once."""
+    grouped: Dict[str, List[LtoEntry]] = defaultdict(list)
+    for entry in entries:
+        grouped[entry.norm_path].append(entry)
+    known: List[Tuple[Tuple[object, ...], DiscoveryAnchor]] = []
+    unknown: List[Tuple[Tuple[object, ...], DiscoveryAnchor]] = []
+    for norm_path, path_entries in grouped.items():
+        representative = sorted(
+            path_entries,
+            key=lambda item: (item.relative_path, item.tape, item.source_pdf, item.source_page),
+        )[0]
+        parts = PurePosixPath(representative.relative_path).parts
+        if len(parts) < 2:
+            continue
+        below = PurePosixPath(*parts[1:]).as_posix()
+        norm_below = normalize_relative_path(below)
+        known_ranges = {
+            (entry.size_min_bytes, entry.size_max_bytes)
+            for entry in path_entries
+            if entry.size_known
+        }
+        contains_unknown = any(not entry.size_known for entry in path_entries)
+        size_known = len(known_ranges) == 1 and not contains_unknown
+        minimum: Optional[int] = None
+        maximum_bytes: Optional[int] = None
+        if size_known:
+            minimum, maximum_bytes = next(iter(known_ranges))
+        anchor = DiscoveryAnchor(
+            relative_below_top=below,
+            norm_path=norm_path,
+            filename=representative.filename,
+            size_min_bytes=minimum,
+            size_max_bytes=maximum_bytes,
+            size_known=size_known,
+            distinctive_below_top=below_top_counts.get(norm_below, 0) == 1,
+        )
+        parent = normalize_relative_path(str(PurePosixPath(below).parent))
+        key: Tuple[object, ...] = (
+            filename_path_counts.get(representative.norm_filename, 0),
+            parent,
+            norm_path,
+        )
+        (known if size_known else unknown).append((key, anchor))
+
+    known.sort(key=lambda item: item[0])
+    unknown.sort(key=lambda item: item[0])
+    selected: List[DiscoveryAnchor] = []
+    used_parents = set()
+    for _, anchor in known:
+        parent = normalize_relative_path(str(PurePosixPath(anchor.relative_below_top).parent))
+        if parent not in used_parents:
+            selected.append(anchor)
+            used_parents.add(parent)
+            if len(selected) >= maximum:
+                return selected
+    for _, anchor in known:
+        if anchor not in selected:
+            selected.append(anchor)
+            if len(selected) >= maximum:
+                return selected
+    for _, anchor in unknown:
+        selected.append(anchor)
+        if len(selected) >= maximum:
+            break
+    return selected
+
+
+def normalized_descendant_file(
+    base: Path, relative_path: str
+) -> Tuple[Optional[Path], Optional[int], str]:
+    """Resolve every path component case-insensitively without following links."""
+    current = base
+    parts = PurePosixPath(relative_path).parts
+    for index, expected in enumerate(parts):
+        try:
+            with os.scandir(current) as scan:
+                matches = [
+                    item
+                    for item in scan
+                    if normalize_component(item.name) == normalize_component(expected)
+                ]
+        except OSError as exc:
+            return None, None, f"directory_read_error:{safe_filesystem_display(str(current))}:{exc!r}"
+        matches.sort(key=lambda item: item.name)
+        usable = []
+        for item in matches:
+            try:
+                if item.is_symlink():
+                    continue
+                if index < len(parts) - 1:
+                    if item.is_dir(follow_symlinks=False):
+                        usable.append(item)
+                elif item.is_file(follow_symlinks=False):
+                    usable.append(item)
+            except OSError:
+                continue
+        if len(usable) != 1:
+            reason = "component_not_found" if not usable else "normalized_component_ambiguous"
+            return None, None, reason
+        current = Path(usable[0].path)
+    try:
+        stat_result = os.stat(current, follow_symlinks=False)
+    except OSError as exc:
+        return None, None, f"file_stat_error:{safe_filesystem_display(str(current))}:{exc!r}"
+    return current, stat_result.st_size, "found"
+
+
+def score_discovery_candidate(
+    candidate: DiscoveryCandidate,
+    anchors: Sequence[DiscoveryAnchor],
+    issues: List[str],
+) -> DiscoveryCandidateScore:
+    path_matches = 0
+    size_matches_count = 0
+    size_mismatches = 0
+    unknown_matches = 0
+    for anchor in anchors:
+        _, size, outcome = normalized_descendant_file(
+            candidate.physical_folder, anchor.relative_below_top
+        )
+        if size is None:
+            if outcome.startswith(("directory_read_error:", "file_stat_error:")):
+                issues.append(
+                    f"anchor_{outcome};candidate="
+                    f"{safe_filesystem_display(str(candidate.physical_folder))}"
+                )
+            continue
+        path_matches += 1
+        if anchor.size_known:
+            assert anchor.size_min_bytes is not None
+            assert anchor.size_max_bytes is not None
+            if anchor.size_min_bytes <= size <= anchor.size_max_bytes:
+                size_matches_count += 1
+            else:
+                size_mismatches += 1
+        else:
+            unknown_matches += 1
+    return DiscoveryCandidateScore(
+        candidate=candidate,
+        anchors_tested=len(anchors),
+        anchors_path_matched=path_matches,
+        anchors_size_matched=size_matches_count,
+        anchors_size_mismatched=size_mismatches,
+        unknown_size_paths_matched=unknown_matches,
+    )
+
+
+def discovery_row(
+    *,
+    top_folder: str,
+    norm_top_folder: str,
+    status: str,
+    scores: Sequence[DiscoveryCandidateScore],
+    anchors_tested: int,
+    reason: str,
+    chosen_score: Optional[DiscoveryCandidateScore] = None,
+) -> dict:
+    ranked = sorted(
+        scores,
+        key=lambda score: (
+            -score.anchors_size_matched,
+            -score.anchors_path_matched,
+            score.anchors_size_mismatched,
+            str(score.candidate.physical_folder),
+        ),
+    )
+    chosen = chosen_score or (ranked[0] if len(ranked) == 1 else None)
+    candidate = chosen.candidate if chosen else None
+    metric_score = chosen or (ranked[0] if ranked else None)
+    return {
+        "lto_top_folder": top_folder,
+        "normalized_lto_top_folder": norm_top_folder,
+        "status": status,
+        "raid_root": (
+            safe_filesystem_display(str(candidate.source.raid_root)) if candidate else ""
+        ),
+        "source_root": (
+            safe_filesystem_display(str(candidate.source.path)) if candidate else ""
+        ),
+        "project_name": candidate.source.project_name if candidate else "",
+        "source_directory": (
+            safe_filesystem_display(str(candidate.source.path)) if candidate else ""
+        ),
+        "physical_folder": (
+            safe_filesystem_display(str(candidate.physical_folder)) if candidate else ""
+        ),
+        "candidate_count": len(scores),
+        "anchors_tested": anchors_tested,
+        "anchors_path_matched": (
+            metric_score.anchors_path_matched if metric_score else ""
+        ),
+        "anchors_size_matched": (
+            metric_score.anchors_size_matched if metric_score else ""
+        ),
+        "anchors_size_mismatched": (
+            metric_score.anchors_size_mismatched if metric_score else ""
+        ),
+        "unknown_size_paths_matched": (
+            metric_score.unknown_size_paths_matched if metric_score else ""
+        ),
+        "confidence_reason": reason,
+    }
+
+
+def discover_lto_mappings(
+    lto_entries: Sequence[LtoEntry],
+    sources: Sequence[SourceDirectory],
+    *,
+    maximum_anchors: int,
+    minimum_anchor_matches: int,
+    issues: List[str],
+) -> List[dict]:
+    if maximum_anchors < 1:
+        raise ValueError("--anchors-per-folder must be at least 1")
+    if minimum_anchor_matches < 1:
+        raise ValueError("--min-anchor-matches must be at least 1")
+    by_top: Dict[str, List[LtoEntry]] = defaultdict(list)
+    filename_paths: Dict[str, set[str]] = defaultdict(set)
+    below_top_folders: Dict[str, set[str]] = defaultdict(set)
+    for entry in lto_entries:
+        by_top[entry.norm_top_folder].append(entry)
+        filename_paths[entry.norm_filename].add(entry.norm_path)
+        parts = PurePosixPath(entry.relative_path).parts
+        if len(parts) >= 2:
+            below_top_folders[
+                normalize_relative_path(PurePosixPath(*parts[1:]).as_posix())
+            ].add(entry.norm_top_folder)
+    filename_path_counts = {key: len(value) for key, value in filename_paths.items()}
+    below_top_counts = {key: len(value) for key, value in below_top_folders.items()}
+    all_candidates = source_top_folders(sources, issues)
+    rows: List[dict] = []
+    for norm_top in sorted(by_top):
+        entries = by_top[norm_top]
+        top_folder = sorted(
+            {entry.top_folder for entry in entries},
+            key=lambda value: (normalize_component(value), value),
+        )[0]
+        anchors = select_discovery_anchors(
+            entries,
+            filename_path_counts=filename_path_counts,
+            below_top_counts=below_top_counts,
+            maximum=maximum_anchors,
+        )
+        name_candidates = [
+            candidate
+            for candidate in all_candidates
+            if normalize_component(candidate.physical_folder.name) == norm_top
+        ]
+        fallback = not name_candidates
+        if fallback:
+            anchors = [anchor for anchor in anchors if anchor.distinctive_below_top]
+        evaluated = name_candidates if name_candidates else all_candidates
+        if fallback:
+            eprint(f"[discover] fallback anchors: {top_folder}")
+        scores = [
+            score_discovery_candidate(candidate, anchors, issues)
+            for candidate in evaluated
+        ]
+        if fallback:
+            scores = [score for score in scores if score.anchors_path_matched > 0]
+        strong = [
+            score
+            for score in scores
+            if score.anchors_size_matched >= minimum_anchor_matches
+            and score.anchors_size_mismatched == 0
+            and not has_surrogateescape(str(score.candidate.source.path))
+            and not has_surrogateescape(str(score.candidate.physical_folder))
+        ]
+        plausible = [
+            score
+            for score in scores
+            if score.anchors_path_matched > 0
+            and score.anchors_size_mismatched == 0
+        ]
+        if len(strong) == 1:
+            status = "MATCHED"
+            reason = (
+                "UNIQUE_STRONG_PATH_AND_SIZE_ANCHORS"
+                f";matched={strong[0].anchors_size_matched}"
+                f";fallback={'yes' if fallback else 'no'}"
+            )
+        elif len(strong) > 1 or len(plausible) > 1:
+            status = "AMBIGUOUS"
+            ambiguous_scores = strong if strong else plausible
+            reason = (
+                "MULTIPLE_PLAUSIBLE_CANDIDATES"
+                f";strong={len(strong)};plausible={len(plausible)}"
+                ";candidates="
+                + "|".join(
+                    safe_filesystem_display(str(score.candidate.physical_folder))
+                    for score in sorted(
+                        ambiguous_scores,
+                        key=lambda item: str(item.candidate.physical_folder),
+                    )
+                )
+            )
+        elif len(plausible) == 1:
+            status = "NAME_MATCH_UNVERIFIED"
+            reason = (
+                "INSUFFICIENT_KNOWN_SIZE_ANCHORS"
+                f";required={minimum_anchor_matches}"
+                f";matched={plausible[0].anchors_size_matched}"
+            )
+        elif name_candidates:
+            status = "NAME_MATCH_UNVERIFIED"
+            reason = "NAME_MATCH_WITHOUT_USABLE_ANCHOR_EVIDENCE"
+        elif scores:
+            status = "NAME_MATCH_UNVERIFIED"
+            reason = "FALLBACK_PATH_HIT_WITHOUT_USABLE_SIZE_EVIDENCE"
+        else:
+            status = "NOT_FOUND"
+            reason = "NO_NAME_OR_PATH_ANCHOR_CANDIDATE"
+        rows.append(
+            discovery_row(
+                top_folder=top_folder,
+                norm_top_folder=norm_top,
+                status=status,
+                scores=scores,
+                anchors_tested=len(anchors),
+                reason=reason,
+                chosen_score=strong[0] if status == "MATCHED" else None,
+            )
+        )
+    return rows
+
+
 def mount_options_for(path: Path) -> Optional[List[str]]:
     findmnt = shutil.which("findmnt")
     if not findmnt:
@@ -1024,7 +1635,38 @@ def mount_options_for(path: Path) -> Optional[List[str]]:
     return [item.strip() for item in options.split(",") if item.strip()]
 
 
-def require_read_only_roots(roots: Sequence[Path], allow_rw: bool) -> None:
+def mount_filesystem_type_for(path: Path) -> Optional[str]:
+    findmnt = shutil.which("findmnt")
+    if not findmnt:
+        return None
+    proc = subprocess.run(
+        [findmnt, "-T", str(path), "-n", "-o", "FSTYPE"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip().lower() or None
+
+
+def require_local_storage_root(root: Path) -> None:
+    filesystem_type = mount_filesystem_type_for(root)
+    if filesystem_type is None:
+        raise RuntimeError(
+            f"Cannot verify filesystem type for {root}; local scan-storage "
+            "must not crawl SMB/NFS storage."
+        )
+    remote_types = {"cifs", "smb3", "nfs", "nfs4", "sshfs", "fuse.sshfs"}
+    if filesystem_type in remote_types:
+        raise RuntimeError(
+            f"scan-storage requires a local volume, not {filesystem_type}: {root}"
+        )
+
+
+def require_read_only_roots(
+    roots: Sequence[Path], allow_rw: bool, *, operation: str = "scan"
+) -> None:
     for root in roots:
         options = mount_options_for(root)
         if options is None:
@@ -1032,25 +1674,231 @@ def require_read_only_roots(roots: Sequence[Path], allow_rw: bool) -> None:
                 f"Cannot verify mount options for {root}; findmnt is unavailable or failed."
             )
             if allow_rw:
-                eprint(f"[scan] WARNING: {message}")
+                eprint(f"[{operation}] WARNING: {message}")
                 continue
             raise RuntimeError(message + " Use a verified RO bind mount or --allow-rw-source.")
         if "ro" not in options:
             if allow_rw:
-                eprint(f"[scan] WARNING: source appears writable: {root} ({','.join(options)})")
+                eprint(
+                    f"[{operation}] WARNING: source appears writable: "
+                    f"{root} ({','.join(options)})"
+                )
             else:
                 raise RuntimeError(
                     f"Source is not mounted read-only: {root} ({','.join(options)}). "
                     "Use an RO bind mount. Override only deliberately with --allow-rw-source."
                 )
         else:
-            eprint(f"[scan] verified read-only mount: {root}")
+            eprint(f"[{operation}] verified read-only mount: {root}")
+
+
+def write_discovery_reports(rows: Sequence[dict], out_dir: Path) -> None:
+    selections = (
+        ("discovery_mapping.csv", rows),
+        (
+            "discovery_ambiguous.csv",
+            [
+                row
+                for row in rows
+                if row["status"] in ("AMBIGUOUS", "NAME_MATCH_UNVERIFIED")
+            ],
+        ),
+        (
+            "discovery_not_found.csv",
+            [row for row in rows if row["status"] == "NOT_FOUND"],
+        ),
+    )
+    for filename, selected in selections:
+        with (out_dir / filename).open(
+            "w", encoding="utf-8-sig", newline=""
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=DISCOVERY_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(selected)
+
+
+def print_discovery_summary(rows: Sequence[dict]) -> None:
+    headings = ("LTO folder", "Project", "Physical folder", "Status")
+    table_rows = []
+    for row in rows:
+        table_rows.append(
+            (
+                str(row["lto_top_folder"]),
+                str(row["project_name"] or "?"),
+                str(row["physical_folder"] or "-"),
+                str(row["status"]),
+            )
+        )
+    widths = [
+        max([len(headings[index])] + [len(row[index]) for row in table_rows])
+        for index in range(len(headings))
+    ]
+
+    def line(values: Sequence[str]) -> str:
+        return "  ".join(
+            value.ljust(widths[index]) for index, value in enumerate(values)
+        ).rstrip()
+
+    print(line(headings))
+    print(line(tuple("-" * width for width in widths)))
+    for row in table_rows:
+        print(line(row))
+    counts = {
+        status: sum(row["status"] == status for row in rows)
+        for status in ("MATCHED", "AMBIGUOUS", "NOT_FOUND")
+    }
+    counts["UNVERIFIED"] = sum(
+        row["status"] == "NAME_MATCH_UNVERIFIED" for row in rows
+    )
+    print("")
+    for status in ("MATCHED", "AMBIGUOUS", "NOT_FOUND", "UNVERIFIED"):
+        print(f"{status}: {counts[status]}")
+
+
+def command_discover(args: argparse.Namespace) -> int:
+    db_path = Path(args.db).expanduser().resolve()
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    raid_roots = sorted(
+        {Path(item).expanduser().resolve() for item in args.raid_root},
+        key=lambda path: (normalize_component(str(path)), str(path)),
+    )
+    for raid_root in raid_roots:
+        if not raid_root.is_dir():
+            raise NotADirectoryError(f"RAID root not found: {raid_root}")
+    ensure_not_nested(out_dir, raid_roots)
+    require_read_only_roots(
+        raid_roots, args.allow_rw_source, operation="discover"
+    )
+    with connect_db_readonly(db_path) as connection:
+        lto_entries = [
+            row_to_lto(row)
+            for row in connection.execute(
+                "SELECT * FROM lto_entries ORDER BY norm_path, id"
+            )
+        ]
+    if not lto_entries:
+        raise RuntimeError("Database has no LTO entries. Run extract first.")
+    sources, issues = discover_source_directories(
+        raid_roots, max_depth=args.max_source_depth
+    )
+    if not sources:
+        raise RuntimeError(
+            "No SOURCE directories found under the supplied RAID roots within "
+            f"depth {args.max_source_depth}."
+        )
+    eprint(f"[discover] SOURCE directories={len(sources):,}")
+    rows = discover_lto_mappings(
+        lto_entries,
+        sources,
+        maximum_anchors=args.anchors_per_folder,
+        minimum_anchor_matches=args.min_anchor_matches,
+        issues=issues,
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_discovery_reports(rows, out_dir)
+    for issue in issues:
+        eprint(f"[discover] WARNING: {issue}")
+    print_discovery_summary(rows)
+    eprint(f"[discover] reports={out_dir}")
+    return 0
+
+
+def load_matched_scan_roots(mapping_path: Path) -> List[MappedScanRoot]:
+    mapping_path = mapping_path.expanduser().resolve()
+    if not mapping_path.is_file():
+        raise FileNotFoundError(f"Discovery mapping not found: {mapping_path}")
+    with mapping_path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "lto_top_folder",
+            "normalized_lto_top_folder",
+            "status",
+            "source_directory",
+            "physical_folder",
+        }
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise RuntimeError(
+                "Discovery mapping is missing columns: " + ", ".join(sorted(missing))
+            )
+        rows = list(reader)
+    jobs: List[MappedScanRoot] = []
+    physical_seen = set()
+    logical_seen = set()
+    for row in rows:
+        if row["status"] != "MATCHED":
+            continue
+        logical_top = row["lto_top_folder"]
+        if not logical_top or "/" in logical_top or "\\" in logical_top:
+            raise RuntimeError(f"Invalid mapped LTO top folder: {logical_top!r}")
+        if normalize_component(logical_top) != row["normalized_lto_top_folder"]:
+            raise RuntimeError(f"Mapping normalization mismatch for {logical_top!r}")
+        source_unresolved = Path(row["source_directory"]).expanduser()
+        if not source_unresolved.is_absolute():
+            raise RuntimeError(
+                f"Mapped SOURCE directory must be absolute: {source_unresolved}"
+            )
+        if source_unresolved.is_symlink():
+            raise RuntimeError(
+                f"Mapped SOURCE directory must not be a symlink: {source_unresolved}"
+            )
+        source = source_unresolved.resolve()
+        physical_text = row["physical_folder"]
+        physical_unresolved = Path(physical_text).expanduser()
+        if not physical_unresolved.is_absolute():
+            raise RuntimeError(
+                f"Mapped physical folder must be absolute: {physical_text}"
+            )
+        if physical_unresolved.is_symlink():
+            raise RuntimeError(f"Mapped physical folder must not be a symlink: {physical_text}")
+        physical = physical_unresolved.resolve()
+        if not source.is_dir() or not physical.is_dir():
+            raise NotADirectoryError(
+                f"Mapped SOURCE or physical folder is unavailable: {source}, {physical}"
+            )
+        if physical.parent != source:
+            raise RuntimeError(
+                f"Mapped physical folder must be directly below SOURCE: {physical}"
+            )
+        physical_key = str(physical)
+        logical_key = normalize_component(logical_top)
+        if physical_key in physical_seen:
+            raise RuntimeError(f"Physical folder mapped more than once: {physical}")
+        if logical_key in logical_seen:
+            raise RuntimeError(f"LTO top folder mapped more than once: {logical_top}")
+        physical_seen.add(physical_key)
+        logical_seen.add(logical_key)
+        jobs.append(
+            MappedScanRoot(
+                source_directory=source,
+                physical_folder=physical,
+                lto_top_folder=logical_top,
+            )
+        )
+    if not jobs:
+        raise RuntimeError("Discovery mapping contains no MATCHED folders.")
+    return sorted(
+        jobs,
+        key=lambda job: (
+            normalize_component(str(job.source_directory)),
+            normalize_component(job.lto_top_folder),
+            str(job.physical_folder),
+        ),
+    )
 
 
 def scan_root(
-    root: Path, *, progress_every: int = 10000, quiet: bool = False
+    root: Path,
+    *,
+    progress_every: int = 10000,
+    quiet: bool = False,
+    walk_root: Optional[Path] = None,
+    logical_top_folder: Optional[str] = None,
 ) -> Tuple[Iterator[StorageEntry], dict, List[dict]]:
     """Iterative scandir walk; never follows symlinks."""
+    scan_start = walk_root or root
+    if logical_top_folder is not None and walk_root is None:
+        raise ValueError("logical_top_folder requires walk_root")
     stats = {
         "source_root": str(root),
         "files": 0,
@@ -1065,7 +1913,7 @@ def scan_root(
     issues: List[dict] = []
 
     def iterator() -> Iterator[StorageEntry]:
-        stack: List[Path] = [root]
+        stack: List[Path] = [scan_start]
         while stack:
             directory = stack.pop()
             try:
@@ -1121,15 +1969,24 @@ def scan_root(
                     continue
 
                 raw_absolute_text = str(child_path)
-                raw_relative_text = child_path.relative_to(root).as_posix()
+                physical_relative_text = child_path.relative_to(root).as_posix()
+                if logical_top_folder is None:
+                    comparison_relative_text = physical_relative_text
+                else:
+                    below_mapped_folder = child_path.relative_to(scan_start).as_posix()
+                    comparison_relative_text = PurePosixPath(
+                        logical_top_folder, below_mapped_folder
+                    ).as_posix()
                 absolute_path_bytes = os.fsencode(raw_absolute_text)
-                relative_path_bytes = os.fsencode(raw_relative_text)
+                # Keep raw physical bytes for folder identity and NUL output,
+                # while comparison_relative_text carries the mapped LTO identity.
+                relative_path_bytes = os.fsencode(physical_relative_text)
                 encoding_valid = not (
                     has_surrogateescape(raw_absolute_text)
-                    or has_surrogateescape(raw_relative_text)
+                    or has_surrogateescape(physical_relative_text)
                 )
                 absolute_display = safe_filesystem_display(raw_absolute_text)
-                relative_display = safe_filesystem_display(raw_relative_text)
+                relative_display = safe_filesystem_display(comparison_relative_text)
                 top, filename = path_parts(relative_display)
                 if encoding_valid:
                     norm_path = normalize_relative_path(relative_display)
@@ -1213,7 +2070,23 @@ def insert_storage_batch(connection: sqlite3.Connection, batch: Sequence[Storage
 
 def command_scan(args: argparse.Namespace) -> int:
     db_path = Path(args.db).expanduser().resolve()
-    roots = [Path(item).expanduser().resolve() for item in args.root]
+    mapping_value = getattr(args, "mapping", None)
+    if mapping_value:
+        mapped = load_matched_scan_roots(Path(mapping_value))
+        scan_jobs: List[Tuple[Path, Optional[Path], Optional[str]]] = [
+            (job.source_directory, job.physical_folder, job.lto_top_folder)
+            for job in mapped
+        ]
+        roots = sorted(
+            {job.source_directory for job in mapped},
+            key=lambda path: (normalize_component(str(path)), str(path)),
+        )
+    else:
+        root_values = getattr(args, "root", None)
+        if not root_values:
+            raise RuntimeError("scan requires --root or --mapping")
+        roots = [Path(item).expanduser().resolve() for item in root_values]
+        scan_jobs = [(root, None, None) for root in roots]
     for root in roots:
         if not root.is_dir():
             raise NotADirectoryError(f"Source root not found: {root}")
@@ -1224,11 +2097,18 @@ def command_scan(args: argparse.Namespace) -> int:
     with connect_db(db_path) as connection:
         connection.executescript("DELETE FROM storage_entries; DELETE FROM scan_issues;")
         connection.commit()
-        all_stats = []
-        for root in roots:
-            eprint(f"[scan] {root}")
+        stats_by_root: Dict[str, dict] = {}
+        for root, walk_root, logical_top_folder in scan_jobs:
+            label = str(walk_root or root)
+            if logical_top_folder is not None:
+                label += f" -> LTO/{logical_top_folder}"
+            eprint(f"[scan] {label}")
             entries, stats, issues = scan_root(
-                root, progress_every=args.progress_every, quiet=args.quiet
+                root,
+                progress_every=args.progress_every,
+                quiet=args.quiet,
+                walk_root=walk_root,
+                logical_top_folder=logical_top_folder,
             )
             batch: List[StorageEntry] = []
             for entry in entries:
@@ -1257,18 +2137,836 @@ def command_scan(args: argparse.Namespace) -> int:
                 ],
             )
             connection.commit()
-            all_stats.append(stats)
+            root_key = str(root)
+            if root_key not in stats_by_root:
+                stats_by_root[root_key] = dict(stats)
+            else:
+                combined = stats_by_root[root_key]
+                for key, value in stats.items():
+                    if key != "source_root" and isinstance(value, int):
+                        combined[key] = int(combined.get(key, 0)) + value
             eprint(
-                f"[scan] completed {root}: {stats['files']:,} files, "
+                f"[scan] completed {label}: {stats['files']:,} files, "
                 f"{human_bytes(stats['bytes'])}, errors={stats['errors']}, "
                 f"non_utf8_paths={stats['non_utf8_paths']}"
             )
 
+        all_stats = [stats_by_root[key] for key in sorted(stats_by_root)]
         set_metadata(connection, "storage_roots", [str(root) for root in roots])
         set_metadata(connection, "storage_scan_stats", all_stats)
+        if mapping_value:
+            set_metadata(connection, "storage_discovery_mapping", str(Path(mapping_value).resolve()))
         set_metadata(connection, "storage_scanned_at", dt.datetime.now().isoformat())
         set_metadata(connection, "tool_version", VERSION)
     eprint(f"[scan] database: {db_path}")
+    return 0
+
+
+def initialize_snapshot_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE snapshot_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE snapshot_files (
+            id INTEGER PRIMARY KEY,
+            absolute_path TEXT NOT NULL,
+            absolute_path_bytes BLOB NOT NULL,
+            relative_path TEXT NOT NULL,
+            relative_path_bytes BLOB NOT NULL,
+            path_encoding_valid INTEGER NOT NULL,
+            project_folder TEXT NOT NULL,
+            norm_project_folder TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            norm_filename TEXT NOT NULL,
+            norm_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            UNIQUE(relative_path_bytes)
+        );
+
+        CREATE TABLE snapshot_issues (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL,
+            issue_type TEXT NOT NULL,
+            details TEXT NOT NULL
+        );
+        """
+    )
+    connection.execute(f"PRAGMA user_version={SNAPSHOT_SCHEMA_VERSION}")
+    connection.commit()
+
+
+def set_snapshot_metadata(
+    connection: sqlite3.Connection, key: str, value: object
+) -> None:
+    connection.execute(
+        "INSERT OR REPLACE INTO snapshot_metadata(key, value) VALUES (?, ?)",
+        (key, str(value)),
+    )
+
+
+def insert_snapshot_files(
+    connection: sqlite3.Connection, entries: Sequence[StorageEntry]
+) -> None:
+    connection.executemany(
+        """
+        INSERT INTO snapshot_files (
+            absolute_path, absolute_path_bytes, relative_path, relative_path_bytes,
+            path_encoding_valid, project_folder, norm_project_folder,
+            filename, norm_filename, norm_path, size_bytes, mtime_ns
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                entry.absolute_path,
+                sqlite3.Binary(entry.absolute_path_bytes),
+                entry.relative_path,
+                sqlite3.Binary(entry.relative_path_bytes),
+                entry.path_encoding_valid,
+                entry.top_folder,
+                entry.norm_top_folder,
+                entry.filename,
+                entry.norm_filename,
+                entry.norm_path,
+                entry.size_bytes,
+                entry.mtime_ns,
+            )
+            for entry in entries
+        ],
+    )
+
+
+def command_scan_storage(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"Volume root not found: {root}")
+    if output.exists():
+        raise FileExistsError(
+            f"Snapshot output already exists; choose a new path: {output}"
+        )
+    ensure_not_nested(output, [root])
+    require_read_only_roots(
+        [root], args.allow_rw_source, operation="scan-storage"
+    )
+    require_local_storage_root(root)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    started_at = dt.datetime.now().isoformat()
+    snapshot_id = str(getattr(args, "snapshot_id", "") or uuid.uuid4())
+    connection = sqlite3.connect(str(output))
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        initialize_snapshot_schema(connection)
+        metadata = {
+            "snapshot_id": snapshot_id,
+            "status": "SCANNING",
+            "server_hostname": args.server,
+            "server_ip": args.server_ip,
+            "volume_name": args.volume,
+            "volume_root": str(root),
+            "started_at": started_at,
+            "tool_version": VERSION,
+        }
+        for key, value in metadata.items():
+            set_snapshot_metadata(connection, key, value)
+        connection.commit()
+
+        entries, stats, issues = scan_root(
+            root,
+            progress_every=args.progress_every,
+            quiet=args.quiet,
+        )
+        batch: List[StorageEntry] = []
+        for entry in entries:
+            batch.append(entry)
+            if len(batch) >= 5000:
+                insert_snapshot_files(connection, batch)
+                connection.commit()
+                batch.clear()
+        if batch:
+            insert_snapshot_files(connection, batch)
+        connection.executemany(
+            "INSERT INTO snapshot_issues(path, issue_type, details) VALUES (?, ?, ?)",
+            [
+                (issue["path"], issue["issue_type"], issue["details"])
+                for issue in issues
+            ],
+        )
+        completed_at = dt.datetime.now().isoformat()
+        for key, value in {
+            "status": "COMPLETE",
+            "completed_at": completed_at,
+            "file_count": stats["files"],
+            "total_size_bytes": stats["bytes"],
+            "issue_count": len(issues),
+        }.items():
+            set_snapshot_metadata(connection, key, value)
+        connection.commit()
+    finally:
+        connection.close()
+    eprint(
+        f"[scan-storage] snapshot={snapshot_id}, files={stats['files']:,}, "
+        f"bytes={stats['bytes']:,}, issues={len(issues):,}, output={output}"
+    )
+    return 0
+
+
+def snapshot_metadata(connection: sqlite3.Connection) -> Dict[str, str]:
+    return {
+        str(row["key"]): str(row["value"])
+        for row in connection.execute(
+            "SELECT key, value FROM snapshot_metadata ORDER BY key"
+        )
+    }
+
+
+def import_storage_snapshot(
+    connection: sqlite3.Connection, snapshot_path: Path
+) -> str:
+    snapshot_path = snapshot_path.expanduser().resolve()
+    with connect_db_readonly(snapshot_path) as snapshot:
+        version = int(snapshot.execute("PRAGMA user_version").fetchone()[0])
+        if version != SNAPSHOT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Unsupported snapshot schema version {version}: {snapshot_path}"
+            )
+        metadata = snapshot_metadata(snapshot)
+        required = {
+            "snapshot_id",
+            "status",
+            "server_hostname",
+            "server_ip",
+            "volume_name",
+            "volume_root",
+            "started_at",
+            "completed_at",
+            "file_count",
+            "total_size_bytes",
+            "issue_count",
+        }
+        missing = required - set(metadata)
+        if missing:
+            raise RuntimeError(
+                f"Snapshot metadata is incomplete ({', '.join(sorted(missing))}): "
+                f"{snapshot_path}"
+            )
+        if metadata["status"] != "COMPLETE":
+            raise RuntimeError(f"Snapshot is not complete: {snapshot_path}")
+        actual_files, actual_bytes = snapshot.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM snapshot_files"
+        ).fetchone()
+        actual_issues = snapshot.execute(
+            "SELECT COUNT(*) FROM snapshot_issues"
+        ).fetchone()[0]
+        expected = (
+            int(metadata["file_count"]),
+            int(metadata["total_size_bytes"]),
+            int(metadata["issue_count"]),
+        )
+        if (actual_files, actual_bytes, actual_issues) != expected:
+            raise RuntimeError(
+                "Snapshot counts do not match metadata: "
+                f"expected={expected}, actual={(actual_files, actual_bytes, actual_issues)}"
+            )
+
+        snapshot_id = metadata["snapshot_id"]
+        existing = connection.execute(
+            """
+            SELECT ss.*, s.hostname, s.ip_address, v.name AS volume_name,
+                   v.root_path AS volume_root
+            FROM storage_scans ss
+            JOIN servers s ON s.id = ss.server_id
+            JOIN volumes v ON v.id = ss.volume_id
+            WHERE ss.snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        identity = (
+            metadata["server_hostname"],
+            metadata["server_ip"],
+            metadata["volume_name"],
+            metadata["volume_root"],
+            expected[0],
+            expected[1],
+            expected[2],
+            version,
+        )
+        if existing is not None:
+            stored_identity = (
+                existing["hostname"],
+                existing["ip_address"],
+                existing["volume_name"],
+                existing["volume_root"],
+                existing["file_count"],
+                existing["total_size_bytes"],
+                existing["issue_count"],
+                existing["snapshot_schema_version"],
+            )
+            if stored_identity != identity:
+                raise RuntimeError(
+                    f"Snapshot identity conflict for {snapshot_id}: {snapshot_path}"
+                )
+            snapshot_columns = (
+                "absolute_path",
+                "absolute_path_bytes",
+                "relative_path",
+                "relative_path_bytes",
+                "path_encoding_valid",
+                "project_folder",
+                "norm_project_folder",
+                "filename",
+                "norm_filename",
+                "norm_path",
+                "size_bytes",
+                "mtime_ns",
+            )
+            snapshot_rows = snapshot.execute(
+                "SELECT " + ", ".join(snapshot_columns)
+                + " FROM snapshot_files ORDER BY relative_path_bytes"
+            )
+            central_rows = connection.execute(
+                "SELECT " + ", ".join(snapshot_columns)
+                + " FROM storage_files WHERE scan_id = ? ORDER BY relative_path_bytes",
+                (existing["id"],),
+            )
+            for snapshot_row, central_row in itertools.zip_longest(
+                snapshot_rows, central_rows
+            ):
+                if snapshot_row is None or central_row is None or tuple(snapshot_row) != tuple(central_row):
+                    raise RuntimeError(
+                        f"Snapshot file inventory conflict for {snapshot_id}: {snapshot_path}"
+                    )
+            snapshot_issues = snapshot.execute(
+                "SELECT path, issue_type, details FROM snapshot_issues ORDER BY id"
+            )
+            central_issues = connection.execute(
+                """
+                SELECT path, issue_type, details FROM storage_scan_issues
+                WHERE scan_id = ? ORDER BY id
+                """,
+                (existing["id"],),
+            )
+            for snapshot_issue, central_issue in itertools.zip_longest(
+                snapshot_issues, central_issues
+            ):
+                if snapshot_issue is None or central_issue is None or tuple(snapshot_issue) != tuple(central_issue):
+                    raise RuntimeError(
+                        f"Snapshot issue inventory conflict for {snapshot_id}: {snapshot_path}"
+                    )
+            return "ALREADY_IMPORTED"
+
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            now = dt.datetime.now().isoformat()
+            server = connection.execute(
+                "SELECT id, ip_address FROM servers WHERE hostname = ?",
+                (metadata["server_hostname"],),
+            ).fetchone()
+            if server is None:
+                cursor = connection.execute(
+                    "INSERT INTO servers(hostname, ip_address, created_at) VALUES (?, ?, ?)",
+                    (metadata["server_hostname"], metadata["server_ip"], now),
+                )
+                server_id = int(cursor.lastrowid)
+            else:
+                if server["ip_address"] != metadata["server_ip"]:
+                    raise RuntimeError(
+                        f"Server IP conflict for {metadata['server_hostname']!r}"
+                    )
+                server_id = int(server["id"])
+            volume = connection.execute(
+                "SELECT id, root_path FROM volumes WHERE server_id = ? AND name = ?",
+                (server_id, metadata["volume_name"]),
+            ).fetchone()
+            if volume is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO volumes(server_id, name, root_path, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (server_id, metadata["volume_name"], metadata["volume_root"], now),
+                )
+                volume_id = int(cursor.lastrowid)
+            else:
+                if volume["root_path"] != metadata["volume_root"]:
+                    raise RuntimeError(
+                        f"Volume root conflict for {metadata['volume_name']!r}"
+                    )
+                volume_id = int(volume["id"])
+            cursor = connection.execute(
+                """
+                INSERT INTO storage_scans (
+                    snapshot_id, server_id, volume_id, source_root, started_at,
+                    completed_at, imported_at, file_count, total_size_bytes,
+                    issue_count, snapshot_schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    server_id,
+                    volume_id,
+                    metadata["volume_root"],
+                    metadata["started_at"],
+                    metadata["completed_at"],
+                    now,
+                    expected[0],
+                    expected[1],
+                    expected[2],
+                    version,
+                ),
+            )
+            scan_id = int(cursor.lastrowid)
+            file_rows = snapshot.execute(
+                "SELECT * FROM snapshot_files ORDER BY id"
+            )
+            batch = []
+            for row in file_rows:
+                batch.append(
+                    (
+                        scan_id,
+                        server_id,
+                        volume_id,
+                        row["absolute_path"],
+                        row["absolute_path_bytes"],
+                        row["relative_path"],
+                        row["relative_path_bytes"],
+                        row["path_encoding_valid"],
+                        row["project_folder"],
+                        row["norm_project_folder"],
+                        row["filename"],
+                        row["norm_filename"],
+                        row["norm_path"],
+                        row["size_bytes"],
+                        row["mtime_ns"],
+                    )
+                )
+                if len(batch) >= 5000:
+                    connection.executemany(
+                        """
+                        INSERT INTO storage_files (
+                            scan_id, server_id, volume_id, absolute_path,
+                            absolute_path_bytes, relative_path, relative_path_bytes,
+                            path_encoding_valid, project_folder, norm_project_folder,
+                            filename, norm_filename, norm_path, size_bytes, mtime_ns
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        batch,
+                    )
+                    batch.clear()
+            if batch:
+                connection.executemany(
+                    """
+                    INSERT INTO storage_files (
+                        scan_id, server_id, volume_id, absolute_path,
+                        absolute_path_bytes, relative_path, relative_path_bytes,
+                        path_encoding_valid, project_folder, norm_project_folder,
+                        filename, norm_filename, norm_path, size_bytes, mtime_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    batch,
+                )
+            connection.executemany(
+                """
+                INSERT INTO storage_scan_issues(scan_id, path, issue_type, details)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (scan_id, row["path"], row["issue_type"], row["details"])
+                    for row in snapshot.execute(
+                        "SELECT path, issue_type, details FROM snapshot_issues ORDER BY id"
+                    )
+                ],
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return "IMPORTED"
+
+
+def command_import_storage_scan(args: argparse.Namespace) -> int:
+    db_path = Path(args.db).expanduser().resolve()
+    snapshot_paths = [Path(item).expanduser().resolve() for item in args.snapshot]
+    with connect_db(db_path) as connection:
+        for snapshot_path in snapshot_paths:
+            result = import_storage_snapshot(connection, snapshot_path)
+            eprint(f"[import-storage-scan] {snapshot_path}: {result}")
+    return 0
+
+
+def command_init_db(args: argparse.Namespace) -> int:
+    db_path = Path(args.db).expanduser().resolve()
+    with connect_db(db_path) as connection:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    eprint(f"[init-db] schema_version={version}, database={db_path}")
+    return 0
+
+
+XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XLSX_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CASSETTE_GENERATION_RE = re.compile(r"^([A-Z]{2,5}[0-9]{3,7})L([5-9])$")
+
+
+def normalize_cassette_label(value: str) -> str:
+    """Normalize only unambiguous tape-generation suffixes such as FF7480L7."""
+    cleaned = unicodedata.normalize("NFC", value).strip().upper()
+    match = CASSETTE_GENERATION_RE.fullmatch(cleaned)
+    if match:
+        cleaned = match.group(1)
+    return normalize_component(cleaned)
+
+
+def xlsx_sheet_targets(archive: zipfile.ZipFile) -> List[Tuple[str, str]]:
+    main = {"m": XLSX_MAIN_NS, "r": XLSX_REL_NS}
+    package = {"p": XLSX_PACKAGE_REL_NS}
+    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+    relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    targets = {
+        element.attrib["Id"]: element.attrib["Target"]
+        for element in relationships.findall("p:Relationship", package)
+    }
+    sheets: List[Tuple[str, str]] = []
+    sheet_container = workbook.find("m:sheets", main)
+    if sheet_container is None:
+        return sheets
+    relation_key = "{" + XLSX_REL_NS + "}id"
+    for sheet in sheet_container:
+        target = targets[sheet.attrib[relation_key]].lstrip("/")
+        if not target.startswith("xl/"):
+            target = "xl/" + target
+        sheets.append((sheet.attrib["name"], target))
+    return sheets
+
+
+def xlsx_shared_strings(archive: zipfile.ZipFile) -> List[str]:
+    name = "xl/sharedStrings.xml"
+    if name not in archive.namelist():
+        return []
+    strings: List[str] = []
+    stack: List[ET.Element] = []
+    with archive.open(name) as stream:
+        for event, element in ET.iterparse(stream, events=("start", "end")):
+            if event == "start":
+                stack.append(element)
+                continue
+            if element.tag == "{" + XLSX_MAIN_NS + "}si":
+                strings.append(
+                    "".join(
+                        node.text or ""
+                        for node in element.iter("{" + XLSX_MAIN_NS + "}t")
+                    )
+                )
+                if len(stack) >= 2:
+                    stack[-2].remove(element)
+            stack.pop()
+    return strings
+
+
+def xlsx_column(reference: str) -> str:
+    match = re.match(r"[A-Z]+", reference)
+    return match.group(0) if match else ""
+
+
+def xlsx_cell_text(cell: ET.Element, shared_strings: Sequence[str]) -> str:
+    cell_type = cell.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        return "".join(
+            node.text or ""
+            for node in cell.iter("{" + XLSX_MAIN_NS + "}t")
+        )
+    value = cell.find("{" + XLSX_MAIN_NS + "}v")
+    if value is None or value.text is None:
+        return ""
+    if cell_type == "s":
+        index = int(value.text)
+        if index < 0 or index >= len(shared_strings):
+            raise RuntimeError(f"Invalid XLSX shared string index: {index}")
+        return shared_strings[index]
+    return value.text
+
+
+def iter_xlsx_rows(
+    archive: zipfile.ZipFile,
+    sheet_target: str,
+    shared_strings: Sequence[str],
+) -> Iterator[Tuple[int, Dict[str, str]]]:
+    row_tag = "{" + XLSX_MAIN_NS + "}row"
+    cell_tag = "{" + XLSX_MAIN_NS + "}c"
+    stack: List[ET.Element] = []
+    with archive.open(sheet_target) as stream:
+        for event, element in ET.iterparse(stream, events=("start", "end")):
+            if event == "start":
+                stack.append(element)
+                continue
+            if element.tag == row_tag:
+                values: Dict[str, str] = {}
+                for cell in element.iter(cell_tag):
+                    column = xlsx_column(cell.attrib.get("r", ""))
+                    value = xlsx_cell_text(cell, shared_strings)
+                    if column and value != "":
+                        values[column] = value
+                row_number = int(element.attrib.get("r", "0"))
+                if values:
+                    yield row_number, values
+                if len(stack) >= 2:
+                    stack[-2].remove(element)
+            stack.pop()
+
+
+def archive_import_state(
+    connection: sqlite3.Connection, source_kind: str, workbook: Path
+) -> Tuple[str, Optional[int]]:
+    stat_result = workbook.stat()
+    existing = connection.execute(
+        "SELECT id, file_size, mtime_ns FROM archive_imports "
+        "WHERE source_kind = ? AND source_path = ?",
+        (source_kind, str(workbook)),
+    ).fetchone()
+    if existing is None:
+        return "NEW", None
+    if (
+        int(existing["file_size"]) == stat_result.st_size
+        and int(existing["mtime_ns"]) == stat_result.st_mtime_ns
+    ):
+        return "ALREADY_IMPORTED", int(existing["id"])
+    raise RuntimeError(
+        f"Previously imported {source_kind} workbook changed in place: {workbook}"
+    )
+
+
+def create_archive_import(
+    connection: sqlite3.Connection, source_kind: str, workbook: Path
+) -> int:
+    stat_result = workbook.stat()
+    cursor = connection.execute(
+        """
+        INSERT INTO archive_imports (
+            source_kind, source_path, file_size, mtime_ns, imported_at, row_count
+        ) VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        (
+            source_kind,
+            str(workbook),
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            dt.datetime.now().isoformat(),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def parse_catalog_size(value: str) -> Optional[int]:
+    stripped = value.strip()
+    return int(stripped) if stripped.isdigit() else None
+
+
+def import_archive_catalog(connection: sqlite3.Connection, workbook: Path) -> str:
+    workbook = workbook.expanduser().resolve()
+    state, _ = archive_import_state(connection, "archive_catalog_files", workbook)
+    if state == "ALREADY_IMPORTED":
+        return state
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        import_id = create_archive_import(
+            connection, "archive_catalog_files", workbook
+        )
+        count = 0
+        with zipfile.ZipFile(workbook) as archive:
+            shared = xlsx_shared_strings(archive)
+            for sheet_name, target in xlsx_sheet_targets(archive):
+                rows = iter_xlsx_rows(archive, target, shared)
+                header_found = False
+                sheet_had_rows = False
+                columns: Dict[str, str] = {}
+                batch = []
+                for row_number, values in rows:
+                    sheet_had_rows = True
+                    normalized_values = {
+                        column: normalize_component(value.strip())
+                        for column, value in values.items()
+                    }
+                    if not header_found:
+                        reverse = {value: column for column, value in normalized_values.items()}
+                        required_headers = {
+                            "project name",
+                            "cassette label",
+                            "path",
+                            "filename",
+                        }
+                        if required_headers.issubset(reverse):
+                            columns = {name: reverse[name] for name in required_headers}
+                            if "size" in reverse:
+                                columns["size"] = reverse["size"]
+                            header_found = True
+                        continue
+                    project = values.get(columns["project name"], "").strip()
+                    cassette = values.get(columns["cassette label"], "").strip()
+                    path_raw = values.get(columns["path"], "").strip()
+                    filename = values.get(columns["filename"], "").strip()
+                    size_raw = values.get(columns.get("size", ""), "").strip()
+                    if not any((project, cassette, path_raw, filename, size_raw)):
+                        continue
+                    batch.append(
+                        (
+                            import_id,
+                            str(workbook),
+                            sheet_name,
+                            row_number,
+                            project,
+                            normalize_component(project),
+                            cassette,
+                            normalize_cassette_label(cassette),
+                            path_raw,
+                            normalize_relative_path(path_raw),
+                            filename,
+                            normalize_component(filename),
+                            size_raw,
+                            parse_catalog_size(size_raw),
+                        )
+                    )
+                    if len(batch) >= 5000:
+                        connection.executemany(
+                            """
+                            INSERT INTO archive_catalog_files (
+                                import_id, source_workbook, source_sheet, source_row,
+                                project_raw, project_norm, cassette_raw, cassette_norm,
+                                path_raw, path_norm, filename_raw, filename_norm,
+                                size_raw, size_bytes
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            batch,
+                        )
+                        count += len(batch)
+                        batch.clear()
+                if batch:
+                    connection.executemany(
+                        """
+                        INSERT INTO archive_catalog_files (
+                            import_id, source_workbook, source_sheet, source_row,
+                            project_raw, project_norm, cassette_raw, cassette_norm,
+                            path_raw, path_norm, filename_raw, filename_norm,
+                            size_raw, size_bytes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        batch,
+                    )
+                    count += len(batch)
+                if not header_found and sheet_had_rows:
+                    raise RuntimeError(f"Catalog headers not found on sheet {sheet_name!r}")
+        connection.execute(
+            "UPDATE archive_imports SET row_count = ? WHERE id = ?",
+            (count, import_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return f"IMPORTED:{count}"
+
+
+def manual_row_two_is_note(value: str) -> bool:
+    cleaned = unicodedata.normalize("NFC", value).strip().rstrip("\\/")
+    return bool(re.fullmatch(r"[A-Za-zА-Яа-я_ -]+[0-9]+", cleaned))
+
+
+def import_manual_catalog(connection: sqlite3.Connection, workbook: Path) -> str:
+    workbook = workbook.expanduser().resolve()
+    state, _ = archive_import_state(connection, "archive_manual_map", workbook)
+    if state == "ALREADY_IMPORTED":
+        return state
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        import_id = create_archive_import(connection, "archive_manual_map", workbook)
+        count = 0
+        with zipfile.ZipFile(workbook) as archive:
+            shared = xlsx_shared_strings(archive)
+            for sheet_name, target in xlsx_sheet_targets(archive):
+                cassette_by_column: Dict[str, str] = {}
+                note_by_column: Dict[str, str] = {}
+                batch = []
+                for row_number, values in iter_xlsx_rows(archive, target, shared):
+                    if row_number == 1:
+                        cassette_by_column = {
+                            column: value.strip()
+                            for column, value in values.items()
+                            if value.strip()
+                        }
+                        continue
+                    if not cassette_by_column:
+                        continue
+                    for column in sorted(values):
+                        if column not in cassette_by_column:
+                            continue
+                        raw_value = values[column].strip()
+                        if not raw_value:
+                            continue
+                        if row_number == 2 and manual_row_two_is_note(raw_value):
+                            note_by_column[column] = raw_value
+                            continue
+                        cassette = cassette_by_column[column]
+                        batch.append(
+                            (
+                                import_id,
+                                str(workbook),
+                                sheet_name,
+                                row_number,
+                                column,
+                                sheet_name,
+                                normalize_component(sheet_name),
+                                cassette,
+                                normalize_cassette_label(cassette),
+                                note_by_column.get(column, ""),
+                                raw_value,
+                                normalize_relative_path(raw_value),
+                            )
+                        )
+                if batch:
+                    connection.executemany(
+                        """
+                        INSERT INTO archive_manual_map (
+                            import_id, source_workbook, source_sheet, source_row,
+                            source_column, project_raw, project_norm, cassette_raw,
+                            cassette_norm, cassette_note_raw, folder_path_raw,
+                            folder_path_norm
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        batch,
+                    )
+                    count += len(batch)
+        connection.execute(
+            "UPDATE archive_imports SET row_count = ? WHERE id = ?",
+            (count, import_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return f"IMPORTED:{count}"
+
+
+def command_import_archive_catalog(args: argparse.Namespace) -> int:
+    workbook = Path(args.file).expanduser().resolve()
+    if not workbook.is_file():
+        raise FileNotFoundError(f"Archive catalog not found: {workbook}")
+    with connect_db(Path(args.db).expanduser().resolve()) as connection:
+        result = import_archive_catalog(connection, workbook)
+    eprint(f"[import-archive-catalog] {workbook}: {result}")
+    return 0
+
+
+def command_import_manual_catalog(args: argparse.Namespace) -> int:
+    workbook = Path(args.file).expanduser().resolve()
+    if not workbook.is_file():
+        raise FileNotFoundError(f"Manual catalog not found: {workbook}")
+    with connect_db(Path(args.db).expanduser().resolve()) as connection:
+        result = import_manual_catalog(connection, workbook)
+    eprint(f"[import-manual-catalog] {workbook}: {result}")
     return 0
 
 
@@ -3018,6 +4716,61 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    init_db = subparsers.add_parser(
+        "init-db", help="Create or migrate a central inventory SQLite database"
+    )
+    init_db.add_argument("--db", required=True, help="Central SQLite database")
+    init_db.set_defaults(func=command_init_db)
+
+    scan_storage = subparsers.add_parser(
+        "scan-storage", help="Create a portable local metadata inventory snapshot"
+    )
+    scan_storage.add_argument("--server", required=True, help="Storage server hostname")
+    scan_storage.add_argument("--server-ip", required=True, help="Storage server IP")
+    scan_storage.add_argument("--volume", required=True, help="Volume name, e.g. VIDEO6")
+    scan_storage.add_argument("--root", required=True, help="Local volume mount root")
+    scan_storage.add_argument("--output", required=True, help="New snapshot SQLite path")
+    scan_storage.add_argument(
+        "--allow-rw-source",
+        action="store_true",
+        help="Allow scanning a volume that is not verified read-only",
+    )
+    scan_storage.add_argument(
+        "--progress-every",
+        type=int,
+        default=10000,
+        help="Print progress every N files (default: 10000; 0 disables)",
+    )
+    scan_storage.add_argument(
+        "--quiet", action="store_true", help="Suppress periodic progress"
+    )
+    scan_storage.set_defaults(func=command_scan_storage)
+
+    import_scan = subparsers.add_parser(
+        "import-storage-scan", help="Import portable storage snapshots into central SQLite"
+    )
+    import_scan.add_argument(
+        "--snapshot", nargs="+", required=True, help="Snapshot SQLite file(s)"
+    )
+    import_scan.add_argument("--db", required=True, help="Central SQLite database")
+    import_scan.set_defaults(func=command_import_storage_scan)
+
+    archive_catalog = subparsers.add_parser(
+        "import-archive-catalog",
+        help="Import the historical per-file MC2 XLSX catalog",
+    )
+    archive_catalog.add_argument("--file", required=True, help="MC2 archive XLSX")
+    archive_catalog.add_argument("--db", required=True, help="Central SQLite database")
+    archive_catalog.set_defaults(func=command_import_archive_catalog)
+
+    manual_catalog = subparsers.add_parser(
+        "import-manual-catalog",
+        help="Import the historical project/tape/folder XLSX map",
+    )
+    manual_catalog.add_argument("--file", required=True, help="Manual archive XLSX")
+    manual_catalog.add_argument("--db", required=True, help="Central SQLite database")
+    manual_catalog.set_defaults(func=command_import_manual_catalog)
+
     extract = subparsers.add_parser("extract", help="Parse one or more YoYotta PDFs")
     extract.add_argument("--pdf", nargs="+", required=True, help="YoYotta PDF report(s)")
     extract.add_argument("--db", required=True, help="SQLite audit database")
@@ -3034,12 +4787,55 @@ def build_parser() -> argparse.ArgumentParser:
     )
     extract.set_defaults(func=command_extract)
 
+    discover = subparsers.add_parser(
+        "discover",
+        help="Map LTO top-level folders to physical folders below RAID SOURCE trees",
+    )
+    discover.add_argument(
+        "--db", required=True, help="Existing SQLite database with extracted LTO records"
+    )
+    discover.add_argument(
+        "--raid-root",
+        action="append",
+        required=True,
+        help="Read-only RAID root; repeat for multiple arrays",
+    )
+    discover.add_argument("--out-dir", required=True, help="Directory for mapping CSV files")
+    discover.add_argument(
+        "--max-source-depth",
+        type=int,
+        default=2,
+        help="Maximum depth below a RAID root at which SOURCE may occur (default: 2)",
+    )
+    discover.add_argument(
+        "--anchors-per-folder",
+        type=int,
+        default=5,
+        help="Maximum distinct relative-path anchors per LTO folder (default: 5)",
+    )
+    discover.add_argument(
+        "--min-anchor-matches",
+        type=int,
+        default=2,
+        help="Known-size path anchors required for MATCHED (default: 2)",
+    )
+    discover.add_argument(
+        "--allow-rw-source",
+        action="store_true",
+        help="Allow discovery on a source mount that is not verified read-only",
+    )
+    discover.set_defaults(func=command_discover)
+
     scan = subparsers.add_parser("scan", help="Scan one or more Linux source roots")
-    scan.add_argument(
+    scan_inputs = scan.add_mutually_exclusive_group(required=True)
+    scan_inputs.add_argument(
         "--root",
         nargs="+",
-        required=True,
         help="Root(s) whose children match paths below /Volumes/<tape>/",
+    )
+    scan_inputs.add_argument(
+        "--mapping",
+        help="discovery_mapping.csv; scan only rows whose status is MATCHED",
     )
     scan.add_argument("--db", required=True, help="SQLite audit database")
     scan.add_argument(
