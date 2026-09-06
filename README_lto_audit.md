@@ -30,7 +30,7 @@
 12. Возможный перенос файла ищется только внутри той же верхней папки: совпадают имя без учёта регистра и размер, но отличается промежуточный путь.
 13. Имена Linux, содержащие байты вне UTF-8, не приводят к остановке сканирования. Точные байты пути сохраняются в SQLite, а в CSV показываются как `\xNN`. Такие записи получают статус `INVALID_FILESYSTEM_ENCODING` и не включаются в автоматические списки копирования.
 
-## Особенность PNG-последовательностей YoYotta
+## Особенность image sequences YoYotta
 
 YoYotta иногда сворачивает последовательность в одну запись вида:
 
@@ -40,7 +40,20 @@ Last  : A003.png
 Frames: 3
 ```
 
-Скрипт разворачивает такие последовательности в отдельные пути. Размер первого и последнего файла известен из PDF. Размер промежуточного файла в PDF отсутствует, поэтому он получает статус `MATCH_PATH_ONLY_SIZE_UNKNOWN` при совпадении пути и отдельно попадает в `ambiguous.csv`/`parse_issues.csv`.
+Скрипт разворачивает такие PNG/EXR/DPX и другие числовые последовательности в
+отдельные пути. Размер первого и последнего файла известен из PDF. Размер
+промежуточного файла в PDF отсутствует, поэтому он получает статус
+`MATCH_PATH_ONLY_SIZE_UNKNOWN` при совпадении пути и отдельно попадает в
+`ambiguous.csv`/`parse_issues.csv`.
+
+На очень длинных строках текстовый слой PDF может перенести окончание `Path` на
+следующую строку. Parser восстанавливает его только когда первая часть явно
+заканчивается `/`, а следующая строка не является другим полем YoYotta. Редкое
+наложение длинного filename на правую колонку `Size` также восстанавливается и
+сохраняется как диагностический `entry_line_layout_recovered`. Если сокращённое
+поле `Name` содержит `...`, но полный filename в `Path` отличается, исходный
+`name_path_disagreement` намеренно остаётся видимым; для file identity
+авторитетен полный `Path`.
 
 ## Установка в venv
 
@@ -51,7 +64,8 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-lto-audit.txt
 ```
 
-Если PyMuPDF не установлен, скрипт попробует использовать системный `pdftotext` из `poppler-utils`.
+Если PyMuPDF не установлен, скрипт попробует использовать системный `pdftotext`
+из `poppler-utils`, затем `txtwrite` из Ghostscript.
 
 ## Центральная inventory database
 
@@ -66,13 +80,21 @@ snapshot создаётся непосредственно на storage-server �
 python lto_audit.py init-db --db ~/lto-inventory/lto_inventory.sqlite3
 ```
 
-Схема имеет явную версию `PRAGMA user_version=2`. Миграция эволюционная:
+Схема имеет явную версию `PRAGMA user_version=3`. Миграция эволюционная:
 существующие `lto_entries`, `storage_entries`, metadata и audit reports не
 удаляются. Добавляются:
 
 - `servers`, `volumes`, `storage_scans`, `storage_files`;
 - `storage_scan_issues`;
 - `archive_imports`, `archive_catalog_files`, `archive_manual_map`.
+- `lto_reports`; поля связи `report_id` в `lto_entries`, `parse_issues` и
+  `report_stats`.
+
+Явная миграция v2 → v3 создаёт по одному legacy report для каждого уже
+сохранённого `source_pdf` и привязывает к нему старые entries, parse issues и
+stats. Исходные PDF при миграции не перечитываются, поэтому у legacy reports
+`content_sha256` остаётся `NULL`. Все storage inventory и XLSX-таблицы остаются
+без изменений.
 
 `storage_files` идентифицирует физическую запись через scan/server/volume и raw
 relative path. Поэтому одинаковый путь на двух серверах остаётся двумя файлами.
@@ -154,9 +176,43 @@ generation suffix (`FF7480L7` → `ff7480`, `CTH342L7` → `cth342`) удаля�
 Проверка реальных файлов дала 403858 строк `archive_catalog_files` и 458 строк
 `archive_manual_map`.
 
-Следующие этапы central workflow — безопасный incremental `import-pdf`, а затем
-database-only matcher. Они намеренно не объединены с inventory import: до
-matcher RAID больше не должен сканироваться.
+### 5. Добавлять новые YoYotta PDF
+
+```bash
+python lto_audit.py import-pdf \
+  2026-09-01_1833_MESTO_SILY.pdf \
+  --db ~/lto-inventory/lto_inventory.sqlite3
+```
+
+Можно передать несколько PDF одним вызовом; каждый из них импортируется своей
+атомарной транзакцией. По умолчанию размеры PDF интерпретируются как decimal.
+Для отчёта с двоичными единицами используйте `--pdf-size-units binary`.
+Смешивание разных интерпретаций в одной базе отклоняется, чтобы не смешивать
+несопоставимые интервалы размеров.
+
+`import-pdf` использует тот же `parse_yoyotta_pdf()`, что и прежняя команда
+`extract`. Поэтому сохраняются tape extraction, Unicode normalization,
+decimal/binary rounded size intervals, First/Last expansion, unknown individual
+sizes, повторные manifest records и parse issues. Старые reports и entries не
+очищаются.
+
+Идентичность PDF — SHA-256 его содержимого. Хеш вычисляется только для самого
+PDF-отчёта, никогда не для media files. Копия уже импортированного PDF под другим
+путём или именем возвращает `ALREADY_IMPORTED` и не запускает дорогой parser
+повторно. Одинаковое имя файла с другим содержимым имеет другой SHA-256 и
+создаёт новый report. Файл хешируется повторно после parsing; если он изменился
+во время обработки, импорт отклоняется.
+
+Для каждого report сохраняются numeric `report_id`, content SHA-256, первый
+увиденный source path/filename, размер и mtime PDF, UTC-время импорта,
+`project_header` и режим единиц. Header `Project` — metadata всего YoYotta
+report, а не достоверная project identity каждой строки mixed-project PDF.
+Legacy-колонка `lto_entries.project` остаётся денормализованным parser provenance
+для совместимости и не должна использоваться matcher'ом как authoritative hint.
+
+Следующий этап central workflow — database-only matcher. Он намеренно не входит
+в Phase 6: `import-pdf` не сканирует RAID, не строит folder mapping и не запускает
+новый audit against inventory.
 
 ## Рекомендуемое RO bind-монтирование
 

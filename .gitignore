@@ -15,3 +15,7 @@ test-runs/
 
 *.csv
 *.nul
+
+.local-data/
+*.sqlite3-wal
+*.sqlite3-shm

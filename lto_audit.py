@@ -11,6 +11,7 @@ Python: 3.9+
 Optional PDF backends:
   1. PyMuPDF (recommended; pip install PyMuPDF)
   2. pdftotext from poppler-utils (automatic fallback)
+  3. Ghostscript txtwrite (final fallback)
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import itertools
 import json
 import math
@@ -39,8 +41,8 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-VERSION = "1.5.0"
-CENTRAL_SCHEMA_VERSION = 2
+VERSION = "1.6.0"
+CENTRAL_SCHEMA_VERSION = 3
 SNAPSHOT_SCHEMA_VERSION = 1
 
 BINARY_UNITS = {
@@ -66,6 +68,14 @@ PDF_SIZE_UNIT_TABLES = {
 
 ENTRY_RE = re.compile(
     r"^(Name|First)\s*:\s*(.*?)\s+Size\s*:\s*"
+    r"([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB|TB)\s*$"
+)
+# Some long YoYotta rows have the filename and the right-aligned Size label
+# painted on top of each other in the PDF text layer. Examples observed in a
+# real report include ``.mpSi4ze : 1.22 GB`` and ``.xmpSize : 2.93 KB``.
+# This deliberately narrow fallback recovers only that layout collision.
+COLLIDED_ENTRY_RE = re.compile(
+    r"^(Name)\s*:\s*(.*?(?:Size|Si\d+ze))\s*:\s*"
     r"([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB|TB)\s*$"
 )
 LAST_RE = re.compile(
@@ -406,24 +416,56 @@ def extract_pdf_lines(pdf_path: Path) -> List[Tuple[int, str]]:
         pass
 
     pdftotext = shutil.which("pdftotext")
-    if not pdftotext:
-        raise RuntimeError(
-            "No PDF backend found. Install PyMuPDF in the venv "
-            "(`pip install PyMuPDF`) or install poppler-utils/pdftotext."
+    if pdftotext:
+        proc = subprocess.run(
+            [pdftotext, "-layout", str(pdf_path), "-"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        text = proc.stdout.decode("utf-8", errors="replace")
+        lines = []
+        pages = text.split("\f")
+        for page_no, page_text in enumerate(pages, start=1):
+            lines.extend((page_no, line.strip()) for line in page_text.splitlines())
+        return lines
 
-    proc = subprocess.run(
-        [pdftotext, "-layout", str(pdf_path), "-"],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    # Ghostscript's txtwrite device is a final fallback commonly available on
+    # the central inventory host. This changes only PDF-to-text extraction;
+    # all YoYotta record parsing still goes through parse_yoyotta_pdf().
+    ghostscript = shutil.which("gs")
+    if ghostscript:
+        proc = subprocess.run(
+            [
+                ghostscript,
+                "-q",
+                "-dNOPAUSE",
+                "-dBATCH",
+                "-dSAFER",
+                "-sDEVICE=txtwrite",
+                "-sOutputFile=-",
+                str(pdf_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        text = proc.stdout.decode("utf-8", errors="replace")
+        lines = []
+        page_no = 1
+        page_marker = re.compile(r"^Page\s+(\d+)$", re.IGNORECASE)
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            match = page_marker.match(line)
+            if match:
+                page_no = int(match.group(1))
+            lines.append((page_no, line))
+        return lines
+
+    raise RuntimeError(
+        "No PDF backend found. Install PyMuPDF in the venv "
+        "(`pip install PyMuPDF`), poppler-utils/pdftotext, or Ghostscript."
     )
-    text = proc.stdout.decode("utf-8", errors="replace")
-    lines = []
-    pages = text.split("\f")
-    for page_no, page_text in enumerate(pages, start=1):
-        lines.extend((page_no, line.strip()) for line in page_text.splitlines())
-    return lines
 
 
 def find_project(lines: Sequence[Tuple[int, str]], fallback: str) -> str:
@@ -456,6 +498,46 @@ def find_preceding_frames(
         if match:
             return int(match.group(1))
     return None
+
+
+def parse_entry_line(line: str) -> Optional[Tuple[str, str, str, str, bool]]:
+    match = ENTRY_RE.match(line)
+    if match:
+        kind, name, number_text, unit = match.groups()
+        return kind, name, number_text, unit, False
+    match = COLLIDED_ENTRY_RE.match(line)
+    if match:
+        kind, damaged_name, number_text, unit = match.groups()
+        return kind, damaged_name, number_text, unit, True
+    return None
+
+
+def complete_wrapped_pdf_path(
+    lines: Sequence[Tuple[int, str]], path_index: int, raw_path: str
+) -> Tuple[str, bool]:
+    """Join a YoYotta file path wrapped immediately after a trailing slash."""
+    if not raw_path.endswith("/") or path_index + 1 >= len(lines):
+        return raw_path, False
+    continuation = lines[path_index + 1][1].strip()
+    if not continuation:
+        return raw_path, False
+    field_prefixes = (
+        "Page ",
+        "Name :",
+        "First :",
+        "Last :",
+        "Created :",
+        "Modified :",
+        "Modiﬁed :",
+        "Path :",
+        "Timecode :",
+        "Duration :",
+        "Rate :",
+        "Frames :",
+    )
+    if continuation.startswith(field_prefixes):
+        return raw_path, False
+    return raw_path + continuation.lstrip("/"), True
 
 
 def make_lto_entry(
@@ -503,12 +585,12 @@ def parse_yoyotta_pdf(
     index = 0
     while index < len(lines):
         page_no, line = lines[index]
-        match = ENTRY_RE.match(line)
-        if not match:
+        parsed_line = parse_entry_line(line)
+        if parsed_line is None:
             index += 1
             continue
 
-        kind, first_name, number_text, unit = match.groups()
+        kind, first_name, number_text, unit, layout_recovered = parsed_line
 
         if kind == "Name":
             raw_path: Optional[str] = None
@@ -519,7 +601,7 @@ def parse_yoyotta_pdf(
                     raw_path = path_match.group(1)
                     path_index = probe
                     break
-                if ENTRY_RE.match(lines[probe][1]):
+                if parse_entry_line(lines[probe][1]) is not None:
                     break
 
             if raw_path is None or path_index is None:
@@ -534,6 +616,10 @@ def parse_yoyotta_pdf(
                 index += 1
                 continue
 
+            raw_path, path_wrapped = complete_wrapped_pdf_path(
+                lines, path_index, raw_path
+            )
+
             try:
                 tape, relative_path = parse_lto_path(raw_path)
                 size = size_interval(number_text, unit, unit_mode=pdf_size_units)
@@ -546,7 +632,25 @@ def parse_yoyotta_pdf(
                     size=size,
                     entry_kind="regular",
                 )
-                if normalize_component(first_name) != normalize_component(entry.filename):
+                if layout_recovered:
+                    issues.append(
+                        {
+                            "source_pdf": str(pdf_path),
+                            "page": page_no,
+                            "issue_type": "entry_line_layout_recovered",
+                            "details": json.dumps(
+                                {
+                                    "entry_line": line,
+                                    "recovered_path": raw_path,
+                                    "path_filename": entry.filename,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    )
+                elif normalize_component(first_name) != normalize_component(
+                    entry.filename
+                ):
                     issues.append(
                         {
                             "source_pdf": str(pdf_path),
@@ -572,7 +676,7 @@ def parse_yoyotta_pdf(
                         "details": f"{line} | {exc}",
                     }
                 )
-            index = path_index + 1
+            index = path_index + 2 if path_wrapped else path_index + 1
             continue
 
         # First/Last image sequence.
@@ -633,6 +737,9 @@ def parse_yoyotta_pdf(
             continue
 
         try:
+            raw_path, path_wrapped = complete_wrapped_pdf_path(
+                lines, path_index, raw_path
+            )
             tape, first_relative = parse_lto_path(raw_path)
             parent = PurePosixPath(first_relative).parent
             first_size = size_interval(number_text, unit, unit_mode=pdf_size_units)
@@ -690,7 +797,7 @@ def parse_yoyotta_pdf(
                     "details": f"{line} | {exc}",
                 }
             )
-        index = path_index + 1
+        index = path_index + 2 if path_wrapped else path_index + 1
 
     stats = {
         "source_pdf": str(pdf_path),
@@ -762,6 +869,18 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS lto_reports (
+            id INTEGER PRIMARY KEY,
+            content_sha256 TEXT UNIQUE,
+            source_path TEXT NOT NULL,
+            source_filename TEXT NOT NULL,
+            file_size_bytes INTEGER,
+            source_mtime_ns INTEGER,
+            imported_at TEXT NOT NULL,
+            project_header TEXT NOT NULL,
+            pdf_size_units TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS report_stats (
@@ -973,8 +1092,138 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE storage_entries ADD COLUMN path_encoding_valid INTEGER NOT NULL DEFAULT 1"
         )
+    migrate_lto_schema_v2_to_v3(connection)
     connection.execute(f"PRAGMA user_version={CENTRAL_SCHEMA_VERSION}")
     connection.commit()
+
+
+def migrate_lto_schema_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Attach legacy YoYotta rows to reports without rereading source PDFs."""
+    lto_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(lto_entries)")
+    }
+    if "report_id" not in lto_columns:
+        connection.execute(
+            "ALTER TABLE lto_entries ADD COLUMN report_id INTEGER REFERENCES lto_reports(id)"
+        )
+
+    issue_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(parse_issues)")
+    }
+    if "report_id" not in issue_columns:
+        connection.execute(
+            "ALTER TABLE parse_issues ADD COLUMN report_id INTEGER REFERENCES lto_reports(id)"
+        )
+
+    stats_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(report_stats)")
+    }
+    needs_stats_rebuild = "report_id" not in stats_columns
+
+    source_rows = connection.execute(
+        """
+        SELECT source_pdf FROM report_stats
+        UNION
+        SELECT source_pdf FROM lto_entries
+        UNION
+        SELECT source_pdf FROM parse_issues
+        ORDER BY source_pdf
+        """
+    ).fetchall()
+    stored_units = connection.execute(
+        "SELECT value FROM metadata WHERE key='pdf_size_units'"
+    ).fetchone()
+    legacy_units = stored_units[0] if stored_units else "LEGACY_BINARY_ASSUMED"
+
+    for source_row in source_rows:
+        source_pdf = source_row[0]
+        linked = connection.execute(
+            "SELECT report_id FROM lto_entries WHERE source_pdf=? AND report_id IS NOT NULL LIMIT 1",
+            (source_pdf,),
+        ).fetchone()
+        if linked is None:
+            linked = connection.execute(
+                "SELECT report_id FROM parse_issues WHERE source_pdf=? AND report_id IS NOT NULL LIMIT 1",
+                (source_pdf,),
+            ).fetchone()
+        if linked is None and not needs_stats_rebuild:
+            linked = connection.execute(
+                "SELECT report_id FROM report_stats WHERE source_pdf=? AND report_id IS NOT NULL LIMIT 1",
+                (source_pdf,),
+            ).fetchone()
+        if linked is not None:
+            report_id = int(linked[0])
+        else:
+            stats_row = connection.execute(
+                "SELECT project FROM report_stats WHERE source_pdf=? LIMIT 1",
+                (source_pdf,),
+            ).fetchone()
+            if stats_row is None:
+                stats_row = connection.execute(
+                    "SELECT project FROM lto_entries WHERE source_pdf=? LIMIT 1",
+                    (source_pdf,),
+                ).fetchone()
+            project = stats_row[0] if stats_row and stats_row[0] is not None else ""
+            cursor = connection.execute(
+                """
+                INSERT INTO lto_reports (
+                    content_sha256, source_path, source_filename, file_size_bytes,
+                    source_mtime_ns, imported_at, project_header, pdf_size_units
+                ) VALUES (NULL, ?, ?, NULL, NULL, '', ?, ?)
+                """,
+                (source_pdf, Path(source_pdf).name, project, legacy_units),
+            )
+            report_id = int(cursor.lastrowid)
+        connection.execute(
+            "UPDATE lto_entries SET report_id=? WHERE source_pdf=? AND report_id IS NULL",
+            (report_id, source_pdf),
+        )
+        connection.execute(
+            "UPDATE parse_issues SET report_id=? WHERE source_pdf=? AND report_id IS NULL",
+            (report_id, source_pdf),
+        )
+
+    if needs_stats_rebuild:
+        connection.execute("ALTER TABLE report_stats RENAME TO report_stats_v2")
+        connection.execute(
+            """
+            CREATE TABLE report_stats (
+                id INTEGER PRIMARY KEY,
+                report_id INTEGER UNIQUE REFERENCES lto_reports(id),
+                source_pdf TEXT NOT NULL,
+                project TEXT,
+                expected_files INTEGER,
+                extracted_files INTEGER NOT NULL,
+                difference INTEGER,
+                sequence_files INTEGER NOT NULL,
+                size_unknown_files INTEGER NOT NULL,
+                issues INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO report_stats (
+                report_id, source_pdf, project, expected_files, extracted_files,
+                difference, sequence_files, size_unknown_files, issues
+            )
+            SELECT r.id, old.source_pdf, old.project, old.expected_files,
+                   old.extracted_files, old.difference, old.sequence_files,
+                   old.size_unknown_files, old.issues
+            FROM report_stats_v2 AS old
+            JOIN lto_reports AS r ON r.source_path=old.source_pdf
+            WHERE r.content_sha256 IS NULL
+            ORDER BY old.source_pdf, r.id
+            """
+        )
+        connection.execute("DROP TABLE report_stats_v2")
+
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lto_entries_report_id ON lto_entries(report_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_parse_issues_report_id ON parse_issues(report_id)"
+    )
 
 
 def insert_lto_data(
@@ -982,6 +1231,9 @@ def insert_lto_data(
     entries: Sequence[LtoEntry],
     issues: Sequence[dict],
     stats: dict,
+    *,
+    report_id: Optional[int] = None,
+    commit: bool = True,
 ) -> None:
     connection.executemany(
         """
@@ -989,10 +1241,10 @@ def insert_lto_data(
             source_pdf, source_page, project, tape, relative_path, norm_path,
             top_folder, norm_top_folder, filename, norm_filename,
             reported_size, size_min_bytes, size_max_bytes, size_known,
-            entry_kind, sequence_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            entry_kind, sequence_id, report_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [
+        (
             (
                 entry.source_pdf,
                 entry.source_page,
@@ -1010,33 +1262,43 @@ def insert_lto_data(
                 entry.size_known,
                 entry.entry_kind,
                 entry.sequence_id,
+                report_id,
             )
             for entry in entries
-        ],
+        ),
     )
     connection.executemany(
         """
-        INSERT INTO parse_issues (source_pdf, page, issue_type, details)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO parse_issues (source_pdf, page, issue_type, details, report_id)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        [
+        (
             (
                 issue["source_pdf"],
                 int(issue["page"]),
                 issue["issue_type"],
                 issue["details"],
+                report_id,
             )
             for issue in issues
-        ],
+        ),
     )
+    if report_id is None:
+        # Preserve legacy extract --append behaviour: its report_stats row was
+        # historically replaced by source path, while manifest rows appended.
+        connection.execute(
+            "DELETE FROM report_stats WHERE report_id IS NULL AND source_pdf=?",
+            (stats["source_pdf"],),
+        )
     connection.execute(
         """
-        INSERT OR REPLACE INTO report_stats (
-            source_pdf, project, expected_files, extracted_files, difference,
-            sequence_files, size_unknown_files, issues
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO report_stats (
+            report_id, source_pdf, project, expected_files, extracted_files,
+            difference, sequence_files, size_unknown_files, issues
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            report_id,
             stats["source_pdf"],
             stats["project"],
             stats["expected_files"],
@@ -1047,7 +1309,8 @@ def insert_lto_data(
             stats["issues"],
         ),
     )
-    connection.commit()
+    if commit:
+        connection.commit()
 
 
 def command_extract(args: argparse.Namespace) -> int:
@@ -1075,7 +1338,8 @@ def command_extract(args: argparse.Namespace) -> int:
                 )
         if not args.append:
             connection.executescript(
-                "DELETE FROM lto_entries; DELETE FROM parse_issues; DELETE FROM report_stats;"
+                "DELETE FROM lto_entries; DELETE FROM parse_issues; "
+                "DELETE FROM report_stats; DELETE FROM lto_reports;"
             )
             connection.commit()
         # Persist the interpretation before inserting any committed PDF rows so
@@ -1100,12 +1364,167 @@ def command_extract(args: argparse.Namespace) -> int:
     return 0
 
 
-def set_metadata(connection: sqlite3.Connection, key: str, value: object) -> None:
+def sha256_file(path: Path) -> str:
+    """Hash a PDF report for import identity; media files are never hashed."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def imported_pdf_result(connection: sqlite3.Connection, report_id: int) -> dict:
+    row = connection.execute(
+        """
+        SELECT r.id, r.content_sha256, r.source_path, r.project_header,
+               r.pdf_size_units, s.expected_files, s.extracted_files, s.issues
+        FROM lto_reports AS r
+        LEFT JOIN report_stats AS s ON s.report_id=r.id
+        WHERE r.id=?
+        """,
+        (report_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"Imported LTO report disappeared: {report_id}")
+    return dict(row)
+
+
+def import_yoyotta_pdf(
+    db_path: Path, pdf_path: Path, *, pdf_size_units: str = "decimal"
+) -> Tuple[str, dict]:
+    """Incrementally import one PDF into a central database atomically."""
+    if pdf_size_units not in PDF_SIZE_UNIT_TABLES:
+        raise ValueError(f"Unsupported PDF size unit mode: {pdf_size_units!r}")
+    pdf_path = pdf_path.expanduser().resolve()
+    if not pdf_path.is_file():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    content_sha256 = sha256_file(pdf_path)
+    with connect_db(db_path) as connection:
+        duplicate = connection.execute(
+            "SELECT id FROM lto_reports WHERE content_sha256=?",
+            (content_sha256,),
+        ).fetchone()
+        if duplicate is not None:
+            return "ALREADY_IMPORTED", imported_pdf_result(connection, int(duplicate[0]))
+        existing_lto_count = int(
+            connection.execute("SELECT COUNT(*) FROM lto_entries").fetchone()[0]
+        )
+        if existing_lto_count:
+            stored_units = read_pdf_size_unit_info(connection)
+            if stored_units.mode != pdf_size_units:
+                raise RuntimeError(
+                    "Cannot import LTO records using PDF size units "
+                    f"{pdf_size_units!r}; existing intervals use "
+                    f"{stored_units.label!r}. Mixing unit interpretations in one "
+                    "central database is not supported."
+                )
+
+    entries, issues, stats = parse_yoyotta_pdf(
+        pdf_path, pdf_size_units=pdf_size_units
+    )
+    if sha256_file(pdf_path) != content_sha256:
+        raise RuntimeError(f"PDF changed while it was being parsed: {pdf_path}")
+    file_stat = pdf_path.stat()
+    imported_at = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    with connect_db(db_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            duplicate = connection.execute(
+                "SELECT id FROM lto_reports WHERE content_sha256=?",
+                (content_sha256,),
+            ).fetchone()
+            if duplicate is not None:
+                connection.rollback()
+                return "ALREADY_IMPORTED", imported_pdf_result(
+                    connection, int(duplicate[0])
+                )
+
+            existing_lto_count = int(
+                connection.execute("SELECT COUNT(*) FROM lto_entries").fetchone()[0]
+            )
+            if existing_lto_count:
+                stored_units = read_pdf_size_unit_info(connection)
+                if stored_units.mode != pdf_size_units:
+                    raise RuntimeError(
+                        "PDF size unit mode changed while waiting for the import transaction."
+                    )
+
+            cursor = connection.execute(
+                """
+                INSERT INTO lto_reports (
+                    content_sha256, source_path, source_filename, file_size_bytes,
+                    source_mtime_ns, imported_at, project_header, pdf_size_units
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    content_sha256,
+                    str(pdf_path),
+                    pdf_path.name,
+                    file_stat.st_size,
+                    file_stat.st_mtime_ns,
+                    imported_at,
+                    stats["project"],
+                    pdf_size_units,
+                ),
+            )
+            report_id = int(cursor.lastrowid)
+            insert_lto_data(
+                connection,
+                entries,
+                issues,
+                stats,
+                report_id=report_id,
+                commit=False,
+            )
+            set_metadata(
+                connection, "pdf_size_units", pdf_size_units, commit=False
+            )
+            set_metadata(
+                connection, "lto_extracted_at", imported_at, commit=False
+            )
+            set_metadata(connection, "tool_version", VERSION, commit=False)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return "IMPORTED", imported_pdf_result(connection, report_id)
+
+
+def command_import_pdf(args: argparse.Namespace) -> int:
+    db_path = Path(args.db).expanduser().resolve()
+    pdf_size_units = getattr(args, "pdf_size_units", "decimal")
+    for item in args.pdf:
+        pdf_path = Path(item).expanduser().resolve()
+        eprint(f"[import-pdf] {pdf_path}")
+        status, result = import_yoyotta_pdf(
+            db_path, pdf_path, pdf_size_units=pdf_size_units
+        )
+        eprint(
+            f"[import-pdf] status={status}, report_id={result['id']}, "
+            f"sha256={result['content_sha256']}, "
+            f"project={result['project_header']!r}, "
+            f"files={result['extracted_files']}, expected={result['expected_files']}, "
+            f"issues={result['issues']}"
+        )
+    eprint(f"[import-pdf] database: {db_path}")
+    return 0
+
+
+def set_metadata(
+    connection: sqlite3.Connection,
+    key: str,
+    value: object,
+    *,
+    commit: bool = True,
+) -> None:
     connection.execute(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
         (key, json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value),
     )
-    connection.commit()
+    if commit:
+        connection.commit()
 
 
 def read_pdf_size_unit_info(connection: sqlite3.Connection) -> PdfSizeUnitInfo:
@@ -3612,7 +4031,12 @@ def compare_manifests(
     export_query_csv(
         connection,
         out_dir / "report_stats.csv",
-        "SELECT * FROM report_stats ORDER BY source_pdf",
+        """
+        SELECT source_pdf, project, expected_files, extracted_files, difference,
+               sequence_files, size_unknown_files, issues
+        FROM report_stats
+        ORDER BY source_pdf, id
+        """,
     )
     export_query_csv(
         connection,
@@ -4770,6 +5194,20 @@ def build_parser() -> argparse.ArgumentParser:
     manual_catalog.add_argument("--file", required=True, help="Manual archive XLSX")
     manual_catalog.add_argument("--db", required=True, help="Central SQLite database")
     manual_catalog.set_defaults(func=command_import_manual_catalog)
+
+    import_pdf = subparsers.add_parser(
+        "import-pdf",
+        help="Incrementally import YoYotta PDF reports into central SQLite",
+    )
+    import_pdf.add_argument("pdf", nargs="+", help="YoYotta PDF report(s)")
+    import_pdf.add_argument("--db", required=True, help="Central SQLite database")
+    import_pdf.add_argument(
+        "--pdf-size-units",
+        choices=sorted(PDF_SIZE_UNIT_TABLES),
+        default="decimal",
+        help="Interpret YoYotta KB/MB/GB/TB as decimal or binary (default: decimal)",
+    )
+    import_pdf.set_defaults(func=command_import_pdf)
 
     extract = subparsers.add_parser("extract", help="Parse one or more YoYotta PDFs")
     extract.add_argument("--pdf", nargs="+", required=True, help="YoYotta PDF report(s)")

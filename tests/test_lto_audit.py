@@ -268,6 +268,329 @@ class PdfSizeUnitTests(unittest.TestCase):
                 )
 
 
+class PdfParserLayoutRegressionTests(unittest.TestCase):
+    def test_wrapped_paths_and_collided_size_label_are_recovered(self):
+        pdf_path = Path("/reports/layout.pdf")
+        lines = [
+            (1, "Project : MIXED  Collection : TEST"),
+            (1, "Total Files : 5"),
+            (1, "Name : Back Inner.jpg  Size : 5.03 MB"),
+            (1, "Created : now"),
+            (1, "Path : /Volumes/T1/TOP/long/"),
+            (1, "nested/Back Inner.jpg"),
+            (1, "Name : actual.mpSi4ze : 1.22 GB"),
+            (1, "Created : now"),
+            (1, "Path : /Volumes/T1/TOP/collision/"),
+            (1, "actual.mp4"),
+            (2, "Duration : 3  Frames : 3"),
+            (2, "First : shot.001.png  Size : 10.00 MB"),
+            (2, "Last : shot.003.png  Size : 11.00 MB"),
+            (2, "Created : now"),
+            (2, "Path : /Volumes/T2/TOP/sequence/"),
+            (2, "shot.001.png"),
+        ]
+        with mock.patch.object(lto_audit, "extract_pdf_lines", return_value=lines):
+            entries, issues, stats = lto_audit.parse_yoyotta_pdf(pdf_path)
+
+        self.assertEqual(stats["expected_files"], 5)
+        self.assertEqual(stats["extracted_files"], 5)
+        self.assertEqual(stats["difference"], 0)
+        self.assertEqual(
+            [entry.relative_path for entry in entries],
+            [
+                "TOP/long/nested/Back Inner.jpg",
+                "TOP/collision/actual.mp4",
+                "TOP/sequence/shot.001.png",
+                "TOP/sequence/shot.002.png",
+                "TOP/sequence/shot.003.png",
+            ],
+        )
+        self.assertEqual(
+            [entry.entry_kind for entry in entries[2:]],
+            ["sequence_first", "sequence_middle_size_unknown", "sequence_last"],
+        )
+        self.assertEqual(
+            [entry.size_known for entry in entries[2:]], [1, 0, 1]
+        )
+        self.assertEqual(
+            [issue["issue_type"] for issue in issues],
+            ["entry_line_layout_recovered", "sequence_file_size_unknown"],
+        )
+
+    def test_real_name_difference_remains_visible_after_path_fix(self):
+        pdf_path = Path("/reports/truncated.pdf")
+        lines = [
+            (1, "Total Files : 1"),
+            (1, "Name : very_long_..._clip.mov  Size : 1.00 GB"),
+            (1, "Path : /Volumes/T1/TOP/very_long_complete_clip.mov"),
+        ]
+        with mock.patch.object(lto_audit, "extract_pdf_lines", return_value=lines):
+            entries, issues, stats = lto_audit.parse_yoyotta_pdf(pdf_path)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(stats["difference"], 0)
+        self.assertEqual(
+            [issue["issue_type"] for issue in issues],
+            ["name_path_disagreement"],
+        )
+
+
+class IncrementalPdfImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.db_path = self.base / "central.sqlite3"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def parsed_result(self, pdf_path, *, project="MIXED_HEADER", invalid=False):
+        entry = lto("DI/clip.mov", 100, 100, tape="CXZ306")
+        entry.source_pdf = str(pdf_path.resolve())
+        entry.project = None if invalid else project
+        issue = {
+            "source_pdf": str(pdf_path.resolve()),
+            "page": 7,
+            "issue_type": "fixture_issue",
+            "details": "kept",
+        }
+        stats = {
+            "source_pdf": str(pdf_path.resolve()),
+            "project": project,
+            "expected_files": 1,
+            "extracted_files": 1,
+            "difference": 0,
+            "sequence_files": 0,
+            "size_unknown_files": 0,
+            "issues": 1,
+        }
+        return [entry], [issue], stats
+
+    def test_import_pdf_reuses_parser_and_links_report_entries_and_issues(self):
+        pdf_path = self.base / "mixed.pdf"
+        pdf_path.write_bytes(b"first PDF content")
+        parsed = self.parsed_result(pdf_path)
+        with mock.patch.object(
+            lto_audit, "parse_yoyotta_pdf", return_value=parsed
+        ) as parser:
+            result = lto_audit.command_import_pdf(
+                argparse.Namespace(
+                    pdf=[str(pdf_path)],
+                    db=str(self.db_path),
+                    pdf_size_units="decimal",
+                )
+            )
+        self.assertEqual(result, 0)
+        parser.assert_called_once_with(pdf_path.resolve(), pdf_size_units="decimal")
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            report = connection.execute("SELECT * FROM lto_reports").fetchone()
+            entry = connection.execute("SELECT * FROM lto_entries").fetchone()
+            issue = connection.execute("SELECT * FROM parse_issues").fetchone()
+            stats = connection.execute("SELECT * FROM report_stats").fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(
+            report["content_sha256"], hashlib.sha256(b"first PDF content").hexdigest()
+        )
+        self.assertEqual(report["project_header"], "MIXED_HEADER")
+        self.assertEqual(entry["report_id"], report["id"])
+        self.assertEqual(issue["report_id"], report["id"])
+        self.assertEqual(stats["report_id"], report["id"])
+        # Kept only as parser provenance; the authoritative header lives on report.
+        self.assertEqual(entry["project"], "MIXED_HEADER")
+
+    def test_same_content_at_another_path_is_not_parsed_or_imported_twice(self):
+        first = self.base / "first.pdf"
+        second = self.base / "renamed-copy.pdf"
+        first.write_bytes(b"identical")
+        second.write_bytes(b"identical")
+        with mock.patch.object(
+            lto_audit,
+            "parse_yoyotta_pdf",
+            return_value=self.parsed_result(first),
+        ) as parser:
+            first_status, first_result = lto_audit.import_yoyotta_pdf(
+                self.db_path, first
+            )
+            second_status, second_result = lto_audit.import_yoyotta_pdf(
+                self.db_path, second
+            )
+        self.assertEqual(first_status, "IMPORTED")
+        self.assertEqual(second_status, "ALREADY_IMPORTED")
+        self.assertEqual(first_result["id"], second_result["id"])
+        self.assertEqual(parser.call_count, 1)
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            counts = connection.execute(
+                "SELECT (SELECT COUNT(*) FROM lto_reports), "
+                "(SELECT COUNT(*) FROM lto_entries), "
+                "(SELECT COUNT(*) FROM report_stats)"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(tuple(counts), (1, 1, 1))
+
+    def test_same_filename_with_different_content_creates_new_report(self):
+        report_path = self.base / "report.pdf"
+        report_path.write_bytes(b"content A")
+
+        def parse(path, *, pdf_size_units):
+            return self.parsed_result(path)
+
+        with mock.patch.object(lto_audit, "parse_yoyotta_pdf", side_effect=parse):
+            self.assertEqual(
+                lto_audit.import_yoyotta_pdf(self.db_path, report_path)[0], "IMPORTED"
+            )
+            report_path.write_bytes(b"content B")
+            self.assertEqual(
+                lto_audit.import_yoyotta_pdf(self.db_path, report_path)[0], "IMPORTED"
+            )
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            counts = connection.execute(
+                "SELECT (SELECT COUNT(*) FROM lto_reports), "
+                "(SELECT COUNT(*) FROM lto_entries), "
+                "(SELECT COUNT(*) FROM report_stats), "
+                "(SELECT COUNT(DISTINCT content_sha256) FROM lto_reports)"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(tuple(counts), (2, 2, 2, 2))
+
+    def test_import_preserves_duplicate_records_and_unknown_size_semantics(self):
+        pdf_path = self.base / "duplicates.pdf"
+        pdf_path.write_bytes(b"duplicates and sequence")
+        first = lto("Project/file.mov", 95, 105, tape="T1")
+        second = lto("Project/file.mov", 95, 105, tape="T2")
+        unknown = lto("Project/frame002.png", None, None, tape="T1")
+        for entry in (first, second, unknown):
+            entry.source_pdf = str(pdf_path.resolve())
+            entry.project = "REPORT_HEADER"
+        stats = {
+            "source_pdf": str(pdf_path.resolve()),
+            "project": "REPORT_HEADER",
+            "expected_files": 3,
+            "extracted_files": 3,
+            "difference": 0,
+            "sequence_files": 1,
+            "size_unknown_files": 1,
+            "issues": 1,
+        }
+        issue = {
+            "source_pdf": str(pdf_path.resolve()),
+            "page": 2,
+            "issue_type": "sequence_file_size_unknown",
+            "details": "frame002.png",
+        }
+        with mock.patch.object(
+            lto_audit,
+            "parse_yoyotta_pdf",
+            return_value=([first, second, unknown], [issue], stats),
+        ):
+            status, _ = lto_audit.import_yoyotta_pdf(self.db_path, pdf_path)
+        self.assertEqual(status, "IMPORTED")
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            duplicate_count = connection.execute(
+                "SELECT COUNT(*) FROM lto_entries WHERE norm_path='project/file.mov'"
+            ).fetchone()[0]
+            unknown_row = connection.execute(
+                "SELECT size_known, size_min_bytes, size_max_bytes, entry_kind "
+                "FROM lto_entries WHERE norm_path='project/frame002.png'"
+            ).fetchone()
+            issue_count = connection.execute(
+                "SELECT COUNT(*) FROM parse_issues"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(duplicate_count, 2)
+        self.assertEqual(tuple(unknown_row), (0, None, None, "sequence_middle_size_unknown"))
+        self.assertEqual(issue_count, 1)
+
+    def test_failed_pdf_insert_rolls_back_entire_report(self):
+        pdf_path = self.base / "broken.pdf"
+        pdf_path.write_bytes(b"broken import")
+        with mock.patch.object(
+            lto_audit,
+            "parse_yoyotta_pdf",
+            return_value=self.parsed_result(pdf_path, invalid=True),
+        ):
+            with self.assertRaises(sqlite3.IntegrityError):
+                lto_audit.import_yoyotta_pdf(self.db_path, pdf_path)
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            counts = connection.execute(
+                "SELECT (SELECT COUNT(*) FROM lto_reports), "
+                "(SELECT COUNT(*) FROM lto_entries), "
+                "(SELECT COUNT(*) FROM parse_issues), "
+                "(SELECT COUNT(*) FROM report_stats)"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(tuple(counts), (0, 0, 0, 0))
+
+    def test_explicit_v2_to_v3_migration_preserves_legacy_pdf_rows(self):
+        connection = sqlite3.connect(str(self.db_path))
+        connection.executescript(
+            """
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO metadata VALUES ('pdf_size_units', 'decimal');
+            CREATE TABLE report_stats (
+                source_pdf TEXT PRIMARY KEY, project TEXT, expected_files INTEGER,
+                extracted_files INTEGER NOT NULL, difference INTEGER,
+                sequence_files INTEGER NOT NULL, size_unknown_files INTEGER NOT NULL,
+                issues INTEGER NOT NULL
+            );
+            CREATE TABLE lto_entries (
+                id INTEGER PRIMARY KEY, source_pdf TEXT NOT NULL,
+                source_page INTEGER NOT NULL, project TEXT NOT NULL, tape TEXT NOT NULL,
+                relative_path TEXT NOT NULL, norm_path TEXT NOT NULL,
+                top_folder TEXT NOT NULL, norm_top_folder TEXT NOT NULL,
+                filename TEXT NOT NULL, norm_filename TEXT NOT NULL,
+                reported_size TEXT NOT NULL, size_min_bytes INTEGER,
+                size_max_bytes INTEGER, size_known INTEGER NOT NULL,
+                entry_kind TEXT NOT NULL, sequence_id TEXT NOT NULL
+            );
+            CREATE TABLE parse_issues (
+                id INTEGER PRIMARY KEY, source_pdf TEXT NOT NULL, page INTEGER NOT NULL,
+                issue_type TEXT NOT NULL, details TEXT NOT NULL
+            );
+            INSERT INTO report_stats VALUES
+                ('/legacy/report.pdf', 'LEGACY', 1, 1, 0, 0, 0, 1);
+            INSERT INTO lto_entries VALUES
+                (1, '/legacy/report.pdf', 1, 'LEGACY', 'T1', 'P/a.mov',
+                 'p/a.mov', 'P', 'p', 'a.mov', 'a.mov', '100 B', 100, 100,
+                 1, 'regular', '');
+            INSERT INTO parse_issues VALUES
+                (1, '/legacy/report.pdf', 1, 'legacy_issue', 'kept');
+            PRAGMA user_version=2;
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        self.assertEqual(
+            lto_audit.command_init_db(argparse.Namespace(db=str(self.db_path))), 0
+        )
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            report = connection.execute("SELECT * FROM lto_reports").fetchone()
+            entry = connection.execute("SELECT * FROM lto_entries").fetchone()
+            issue = connection.execute("SELECT * FROM parse_issues").fetchone()
+            stats = connection.execute("SELECT * FROM report_stats").fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(version, 3)
+        self.assertIsNone(report["content_sha256"])
+        self.assertEqual(report["source_path"], "/legacy/report.pdf")
+        self.assertEqual(entry["report_id"], report["id"])
+        self.assertEqual(issue["report_id"], report["id"])
+        self.assertEqual(stats["report_id"], report["id"])
+
+
 class SafetyHelperTests(unittest.TestCase):
     def test_readonly_connection_rejects_writes(self):
         with tempfile.TemporaryDirectory() as directory:
