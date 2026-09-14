@@ -34,7 +34,7 @@ import unicodedata
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path, PurePosixPath
@@ -5130,6 +5130,158 @@ def command_all(args: argparse.Namespace) -> int:
     return command_compare(compare_args)
 
 
+def compare_archive_project(connection, report_id, project, folders):
+    """Compare catalog directory+filename with one report, without storage access."""
+    report = connection.execute("SELECT * FROM lto_reports WHERE id=?", (report_id,)).fetchone()
+    if report is None:
+        raise ValueError(f"Unknown report ID: {report_id}")
+    expected = defaultdict(list)
+    for row in connection.execute(
+        "SELECT * FROM archive_catalog_files WHERE project_norm=? ORDER BY id",
+        (normalize_component(project),),
+    ):
+        path = normalize_relative_path(row["path_raw"] + "/" + row["filename_raw"])
+        expected[path].append(row)
+    if not expected:
+        raise ValueError(f"No imported archive project: {project}")
+    selected = sorted(set(normalize_relative_path(f) for f in folders)) if folders else sorted(
+        set(p.split("/")[0] for p in expected)
+    )
+    if any(not f or ".." in f.split("/") for f in selected):
+        raise ValueError("Folder must be a nonempty relative catalog prefix without '..'")
+    observed = defaultdict(list)
+    for row in connection.execute("SELECT * FROM lto_entries WHERE report_id=? ORDER BY id", (report_id,)):
+        observed[row["norm_path"]].append(row)
+    issue_count = connection.execute(
+        "SELECT count(*) FROM parse_issues WHERE report_id=?", (report_id,)
+    ).fetchone()[0]
+    bad_counts = connection.execute(
+        "SELECT count(*) FROM report_stats WHERE report_id=? AND difference != 0", (report_id,)
+    ).fetchone()[0]
+    summaries, details = [], []
+    for folder in selected:
+        exp = {p: rows for p, rows in expected.items() if p.startswith(folder + "/")}
+        if not exp:
+            raise ValueError(f"Folder not found in archive project {project}: {folder}")
+        tapes = {r["cassette_norm"] for rows in exp.values() for r in rows if r["cassette_norm"]}
+        counts = Counter()
+        seen_tapes = set()
+        for path, rows in sorted(exp.items()):
+            candidates = observed.get(path, [])
+            allowed = {r["cassette_norm"] for r in rows if r["cassette_norm"]}
+            matches = [r for r in candidates if normalize_cassette_label(r["tape"]) in allowed]
+            sizes = {r["size_bytes"] for r in rows if r["size_bytes"] is not None}
+            ranges = {(r["size_min_bytes"], r["size_max_bytes"]) for r in candidates if r["size_known"]}
+            notes = []
+            if len(sizes) > 1 or len(ranges) > 1:
+                status = "SIZE_CONFLICT"
+                notes.append("Conflicting duplicate sizes/intervals; manual review")
+            elif any(not r["filename_raw"] or not r["cassette_norm"] or ".." in r["path_norm"].split("/") for r in rows):
+                status = "CONFLICT"
+                notes.append("Incomplete or unsafe catalog identity; manual review")
+            elif not candidates:
+                status = "MISSING_ON_REPORT"
+            elif not matches:
+                status = "CASSETTE_CONFLICT"
+                notes.append("Same full path only on unexpected cassette")
+            elif sizes and ranges and not all(lo <= next(iter(sizes)) <= hi for lo, hi in ranges):
+                status = "SIZE_CONFLICT"
+            elif not sizes or any(r["size_bytes"] is None for r in rows) or any(not r["size_known"] for r in matches):
+                status = "PATH_MATCH_SIZE_UNKNOWN"
+            else:
+                status = "EXACT"
+            if status in ("EXACT", "PATH_MATCH_SIZE_UNKNOWN"):
+                counts["found"] += 1
+            elif status == "MISSING_ON_REPORT":
+                counts["missing"] += 1
+            else:
+                counts["conflicts"] += 1
+            if status == "PATH_MATCH_SIZE_UNKNOWN":
+                counts["size_unknown"] += 1
+            # One row per source record / observed copy preserves all provenance.
+            for source in rows:
+                for obs in candidates or [None]:
+                    if obs is not None:
+                        seen_tapes.add(obs["tape"])
+                    details.append(dict(
+                        status=status, archive_project=project, folder=folder,
+                        xlsx_cassette=source["cassette_raw"], yoyotta_cassette=obs["tape"] if obs else "",
+                        path=path, filename=source["filename_raw"], xlsx_size=source["size_bytes"],
+                        lto_size_min=obs["size_min_bytes"] if obs else None,
+                        lto_size_max=obs["size_max_bytes"] if obs else None,
+                        notes="; ".join(notes), source_workbook=source["source_workbook"],
+                        source_sheet=source["source_sheet"], source_row=source["source_row"],
+                        report_id=report_id, source_page=obs["source_page"] if obs else None,
+                        lto_entry_id=obs["id"] if obs else None,
+                    ))
+        for path, rows in sorted(observed.items()):
+            if path in exp or not path.startswith(folder + "/"):
+                continue
+            scoped = [r for r in rows if normalize_cassette_label(r["tape"]) in tapes]
+            if not scoped:
+                continue
+            counts["unexpected"] += 1
+            for obs in scoped:
+                seen_tapes.add(obs["tape"])
+                details.append(dict(
+                    status="UNEXPECTED_ON_REPORT", archive_project=project, folder=folder,
+                    xlsx_cassette="", yoyotta_cassette=obs["tape"], path=path, filename=obs["filename"],
+                    xlsx_size=None, lto_size_min=obs["size_min_bytes"], lto_size_max=obs["size_max_bytes"],
+                    notes="Within exact folder prefix and expected cassette scope",
+                    report_id=report_id, source_page=obs["source_page"], lto_entry_id=obs["id"],
+                ))
+        result = "COMPLETE"
+        if counts["conflicts"] or issue_count or bad_counts:
+            result = "CONFLICT"
+        elif counts["missing"] == len(exp):
+            result = "NOT_FOUND"
+        elif counts["missing"] or counts["unexpected"]:
+            result = "INCOMPLETE"
+        summaries.append(dict(
+            project=project, folder=folder, expected_unique_files=len(exp),
+            found=counts["found"], missing=counts["missing"], conflicts=counts["conflicts"],
+            unexpected=counts["unexpected"], size_unknown=counts["size_unknown"],
+            expected_cassette_labels=unique_join(r["cassette_raw"] for rows in exp.values() for r in rows),
+            observed_cassette_labels=unique_join(seen_tapes), result=result,
+            report_id=report_id, report_parse_issues=issue_count,
+            report_count_mismatches=bad_counts,
+            notes="Presence only; unknown sizes require review" if counts["size_unknown"] else "",
+        ))
+    return summaries, details
+
+
+def command_compare_archive_project(args):
+    db = Path(args.db).expanduser()
+    out = Path(args.out_dir).expanduser()
+    # Refuse symlinks in explicitly supplied paths, including parent components.
+    for path in (db.absolute(), out.absolute()):
+        if any(p.is_symlink() for p in (path, *path.parents)):
+            raise ValueError(f"Symlink path is not allowed: {path}")
+    connection = connect_db_readonly(db)
+    try:
+        summaries, details = compare_archive_project(connection, args.report, args.archive_project, args.folder)
+        destinations = [out / name for name in ("archive_folder_summary.csv", "archive_file_details.csv")]
+        if any(p.is_symlink() or p.exists() for p in destinations):
+            raise ValueError("Comparison output already exists; use a new --out-dir")
+        out.mkdir(parents=True, exist_ok=True)
+        detail_fields = ["status", "archive_project", "folder", "xlsx_cassette", "yoyotta_cassette",
+                         "path", "filename", "xlsx_size", "lto_size_min", "lto_size_max", "notes",
+                         "source_workbook", "source_sheet", "source_row", "report_id", "source_page", "lto_entry_id"]
+        for destination, rows, fields in zip(destinations, (summaries, details), (list(summaries[0]), detail_fields)):
+            handle, writer = csv_writer(destination, fields)
+            with handle:
+                writer.writerows(rows)
+        for row in summaries:
+            print(f"{row['project']} {row['folder']}: {row['result']} "
+                  f"expected={row['expected_unique_files']} found={row['found']} "
+                  f"missing={row['missing']} conflicts={row['conflicts']} "
+                  f"unexpected={row['unexpected']} size_unknown={row['size_unknown']} "
+                  f"report_issues={row['report_parse_issues']} count_mismatches={row['report_count_mismatches']}")
+        return 0
+    finally:
+        connection.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -5139,6 +5291,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    archive_compare = subparsers.add_parser(
+        "compare-archive-project", help="Compare historical XLSX project with one imported PDF report"
+    )
+    archive_compare.add_argument("--db", required=True)
+    archive_compare.add_argument("--report", required=True, type=int, help="Imported numeric report ID")
+    archive_compare.add_argument("--archive-project", required=True)
+    archive_compare.add_argument("--folder", action="append", default=[], help="Exact directory prefix; repeatable")
+    archive_compare.add_argument("--out-dir", required=True)
+    archive_compare.set_defaults(func=command_compare_archive_project)
 
     init_db = subparsers.add_parser(
         "init-db", help="Create or migrate a central inventory SQLite database"

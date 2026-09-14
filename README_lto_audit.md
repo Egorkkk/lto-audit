@@ -778,3 +778,65 @@ SQLite-файл и CSV являются снимком одного запуск
 ~/lto-audit/KANSK/2026-07-22_before_copy/
 ~/lto-audit/KANSK/2026-07-23_after_copy/
 ```
+
+## Сверка исторического проекта с одним YoYotta report
+
+`compare-archive-project` работает по готовой SQLite schema v3, открывая её только
+для чтения. Storage inventory не нужен. Новых таблиц и зависимостей нет.
+
+```bash
+python3 lto_audit.py import-archive-catalog \
+  --file 'MC2 - LTO Backups.xlsx' --db .local-data/vu2.sqlite3
+python3 lto_audit.py import-pdf NEW_REPORT.pdf --db .local-data/vu2.sqlite3
+# Подставить numeric report_id, напечатанный import-pdf:
+python3 lto_audit.py compare-archive-project \
+  --db .local-data/vu2.sqlite3 --report 1 --archive-project VU2 \
+  --folder 20240611 --out-dir reports/vu2-20240611
+```
+
+`--folder` — полный префикс каталога относительно корня кассеты; можно повторять.
+Без него выбираются все верхние папки исторического проекта. Несуществующие
+project/report/folder считаются ошибкой. Для повторного запуска нужен новый
+каталог вывода. База должна быть закрыта другими процессами, без WAL/SHM.
+
+Переиспользуются существующие XLSX importer, YoYotta parser, NFC/casefold path
+normalization и conservative cassette normalization. XLSX Path трактуется как
+каталог, к нему добавляется Filename. В реальном VU2 это, например,
+`/20240611/cam_a/A_0003_1EZN` и `A_0003C001_240611_104937_h1EZN.mxf`.
+Начальные `/` и `./` обрабатывает существующая нормализация. Префиксы SOURCE,
+project или произвольные компоненты не отбрасываются; fuzzy matching нет.
+
+Создаются два CSV в UTF-8 BOM:
+
+- `archive_folder_summary.csv`: уникальные expected paths, found, missing,
+  conflicts, unexpected, size_unknown, исходные кассеты обеих сторон и result;
+- `archive_file_details.csv`: status, project/folder, обе кассеты, нормализованный
+  полный path, filename, XLSX bytes, LTO interval, notes, workbook/sheet/row и
+  report/page/entry ID. Каждая историческая строка сопоставляется со всеми
+  наблюдаемыми копиями полного пути; поэтому число строк CSV больше числа
+  логических файлов. Повторы не увеличивают счётчики summary.
+
+`EXACT` требует полного пути, хотя бы одной исторической кассеты и совместимого
+известного размера. `PATH_MATCH_SIZE_UNKNOWN` подтверждает присутствие при
+неизвестном размере. `MISSING_ON_REPORT` означает отсутствие полного пути;
+`CASSETTE_CONFLICT` — путь есть только на других кассетах. Противоречащие размеры
+исторических дублей или разные известные интервалы PDF дают `SIZE_CONFLICT`.
+Неполная historical identity даёт `CONFLICT` и требует ручной проверки.
+Наличие хотя бы одной ожидаемой копии достаточно для found; полнота всех
+исторических копий отдельно не утверждается, provenance остаётся в CSV.
+
+`UNEXPECTED_ON_REPORT` ограничен точным выбранным префиксом и историческими
+кассетами этой папки. Файлы на прочих кассетах не объявляются лишними по имени
+папки. Заголовок Project из PDF не используется для фильтрации mixed report.
+
+`COMPLETE` означает покрытие уникальных исторических путей. При size_unknown
+оно не подтверждает размеры; нужна ручная проверка. `NOT_FOUND` — все expected
+пути отсутствуют, `INCOMPLETE` — есть missing или unexpected, `CONFLICT` — есть
+конфликты. Любые parse issues или расхождение declared/extracted count всего
+report также консервативно дают `CONFLICT` для папки: локализацию проблемы
+потребуется проверить вручную. Числа этих диагностик вынесены в summary.
+Никакой из результатов не является разрешением на удаление.
+
+Ограничения: сравнение загружает выбранный проект и один report в память;
+все импорты того же project в базе рассматриваются вместе. Новые соглашения
+о путях следует добавлять только после проверки примеров обоих источников.
