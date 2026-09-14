@@ -5143,7 +5143,13 @@ def compare_archive_project(connection, report_id, project, folders):
         path = normalize_relative_path(row["path_raw"] + "/" + row["filename_raw"])
         expected[path].append(row)
     if not expected:
-        raise ValueError(f"No imported archive project: {project}")
+        available = [r[0] for r in connection.execute(
+            "SELECT DISTINCT project_raw FROM archive_catalog_files ORDER BY project_raw"
+        )]
+        raise ValueError(
+            f"No imported archive project: {project}. Available projects: "
+            + (", ".join(available) if available else "(catalog is empty)")
+        )
     selected = sorted(set(normalize_relative_path(f) for f in folders)) if folders else sorted(
         set(p.split("/")[0] for p in expected)
     )
@@ -5198,6 +5204,10 @@ def compare_archive_project(connection, report_id, project, folders):
                 counts["conflicts"] += 1
             if status == "PATH_MATCH_SIZE_UNKNOWN":
                 counts["size_unknown"] += 1
+            elif status == "EXACT":
+                counts["size_verified"] += 1
+            elif status == "SIZE_CONFLICT":
+                counts["size_conflicts"] += 1
             # One row per source record / observed copy preserves all provenance.
             for source in rows:
                 for obs in candidates or [None]:
@@ -5231,13 +5241,25 @@ def compare_archive_project(connection, report_id, project, folders):
                     report_id=report_id, source_page=obs["source_page"], lto_entry_id=obs["id"],
                 ))
         result = "COMPLETE"
-        if counts["conflicts"] or issue_count or bad_counts:
+        if counts["conflicts"]:
             result = "CONFLICT"
-        elif counts["missing"] == len(exp):
+        elif not seen_tapes:
             result = "NOT_FOUND"
         elif counts["missing"] or counts["unexpected"]:
             result = "INCOMPLETE"
+        size_status = "UNKNOWN"
+        if counts["size_conflicts"]:
+            size_status = "CONFLICT"
+        elif counts["size_verified"]:
+            size_status = "PARTIAL" if counts["size_unknown"] else "VERIFIED"
+        summary_notes = []
+        if counts["size_unknown"]:
+            summary_notes.append("Presence only; unknown sizes require review")
+        if issue_count or bad_counts:
+            summary_notes.append("Report diagnostics are global informational metadata; not localized to this folder")
         summaries.append(dict(
+            archive_project=project, expected=len(exp), presence_status=result,
+            size_status=size_status, size_verified=counts["size_verified"],
             project=project, folder=folder, expected_unique_files=len(exp),
             found=counts["found"], missing=counts["missing"], conflicts=counts["conflicts"],
             unexpected=counts["unexpected"], size_unknown=counts["size_unknown"],
@@ -5245,7 +5267,7 @@ def compare_archive_project(connection, report_id, project, folders):
             observed_cassette_labels=unique_join(seen_tapes), result=result,
             report_id=report_id, report_parse_issues=issue_count,
             report_count_mismatches=bad_counts,
-            notes="Presence only; unknown sizes require review" if counts["size_unknown"] else "",
+            notes="; ".join(summary_notes),
         ))
     return summaries, details
 
@@ -5272,10 +5294,11 @@ def command_compare_archive_project(args):
             with handle:
                 writer.writerows(rows)
         for row in summaries:
-            print(f"{row['project']} {row['folder']}: {row['result']} "
+            print(f"{row['archive_project']} {row['folder']}: {row['presence_status']} "
                   f"expected={row['expected_unique_files']} found={row['found']} "
                   f"missing={row['missing']} conflicts={row['conflicts']} "
-                  f"unexpected={row['unexpected']} size_unknown={row['size_unknown']} "
+                  f"unexpected={row['unexpected']} size_status={row['size_status']} "
+                  f"size_unknown={row['size_unknown']} "
                   f"report_issues={row['report_parse_issues']} count_mismatches={row['report_count_mismatches']}")
         return 0
     finally:

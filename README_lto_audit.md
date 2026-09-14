@@ -786,13 +786,27 @@ SQLite-файл и CSV являются снимком одного запуск
 
 ```bash
 python3 lto_audit.py import-archive-catalog \
-  --file 'MC2 - LTO Backups.xlsx' --db .local-data/vu2.sqlite3
-python3 lto_audit.py import-pdf NEW_REPORT.pdf --db .local-data/vu2.sqlite3
+  --file 'MC2 - LTO Backups.xlsx' --db .local-data/lto_inventory.sqlite3
+python3 lto_audit.py import-pdf NEW_REPORT.pdf --db .local-data/lto_inventory.sqlite3
 # Подставить numeric report_id, напечатанный import-pdf:
 python3 lto_audit.py compare-archive-project \
-  --db .local-data/vu2.sqlite3 --report 1 --archive-project VU2 \
+  --db .local-data/lto_inventory.sqlite3 --report 1 --archive-project VU2 \
   --folder 20240611 --out-dir reports/vu2-20240611
 ```
+
+Одна central DB содержит все проекты XLSX и все imported reports; inventory
+может присутствовать, но этой командой не используется. `--archive-project`
+выбирает только historical expected subset по существующей NFC/casefold
+нормализации, без aliases или fuzzy matching. Например, в той же базе:
+
+```bash
+python3 lto_audit.py compare-archive-project \
+  --db .local-data/lto_inventory.sqlite3 --report 1 --archive-project KBD2 \
+  --out-dir reports/kbd2
+```
+
+Отдельная база на проект не нужна. При неизвестном project ошибка перечисляет
+реальные project names из archive_catalog_files.
 
 `--folder` — полный префикс каталога относительно корня кассеты; можно повторять.
 Без него выбираются все верхние папки исторического проекта. Несуществующие
@@ -808,8 +822,11 @@ project или произвольные компоненты не отбрасы
 
 Создаются два CSV в UTF-8 BOM:
 
-- `archive_folder_summary.csv`: уникальные expected paths, found, missing,
-  conflicts, unexpected, size_unknown, исходные кассеты обеих сторон и result;
+- `archive_folder_summary.csv`: archive_project, folder, expected, found, missing,
+  conflicts, unexpected, size_unknown, size_verified, presence_status, size_status,
+  исходные кассеты, report_parse_issues, report_count_mismatches и notes.
+  Старые project, expected_unique_files и result сохранены как aliases для
+  archive_project, expected и presence_status;
 - `archive_file_details.csv`: status, project/folder, обе кассеты, нормализованный
   полный path, filename, XLSX bytes, LTO interval, notes, workbook/sheet/row и
   report/page/entry ID. Каждая историческая строка сопоставляется со всеми
@@ -829,13 +846,32 @@ project или произвольные компоненты не отбрасы
 кассетами этой папки. Файлы на прочих кассетах не объявляются лишними по имени
 папки. Заголовок Project из PDF не используется для фильтрации mixed report.
 
-`COMPLETE` означает покрытие уникальных исторических путей. При size_unknown
-оно не подтверждает размеры; нужна ручная проверка. `NOT_FOUND` — все expected
-пути отсутствуют, `INCOMPLETE` — есть missing или unexpected, `CONFLICT` — есть
-конфликты. Любые parse issues или расхождение declared/extracted count всего
-report также консервативно дают `CONFLICT` для папки: локализацию проблемы
-потребуется проверить вручную. Числа этих диагностик вынесены в summary.
-Никакой из результатов не является разрешением на удаление.
+Главный итог — `presence_status` (также печатается в терминал):
+
+- `CONFLICT`: есть конкретные file-level conflicts, включая SIZE_CONFLICT;
+- `NOT_FOUND`: нет observed material в текущей области сопоставления (нет ни
+  кандидатов по полным expected paths, ни unexpected на ожидаемых кассетах);
+- `INCOMPLETE`: есть missing или unexpected без file-level conflicts;
+- `COMPLETE`: missing=unexpected=conflicts=0, даже если размеры неизвестны.
+
+`size_status` относится к найденным expected files, независимо от полноты папки:
+
+- `CONFLICT`: есть SIZE_CONFLICT;
+- `VERIFIED`: есть EXACT, а PATH_MATCH_SIZE_UNKNOWN нет;
+- `PARTIAL`: есть и EXACT, и PATH_MATCH_SIZE_UNKNOWN;
+- `UNKNOWN`: нет проверенных размеров, в том числе если ничего не найдено.
+
+Missing и unexpected не подтверждают и не опровергают размеры найденных файлов.
+`size_verified` считает уникальные EXACT files; `size_unknown` — уникальные
+PATH_MATCH_SIZE_UNKNOWN. Detailed CSV и правила matching не изменены.
+
+`report_parse_issues` и `report_count_mismatches` — **глобальные информационные
+диагностики** всего PDF. Они не участвуют в presence_status/size_status и
+не локализованы на папку: schema parse_issues не содержит надёжной связи с
+entry/path, поэтому folder_parse_issues не угадывается по свободному тексту.
+Предупреждение об этом сохраняется в notes. COMPLETE означает полноту по
+импортированным metadata, не подтверждает качество PDF parser или неизвестные
+размеры. Никакой результат не является разрешением на удаление.
 
 Ограничения: сравнение загружает выбранный проект и один report в память;
 все импорты того же project в базе рассматриваются вместе. Новые соглашения

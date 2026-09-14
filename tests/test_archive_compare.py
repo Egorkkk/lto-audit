@@ -52,7 +52,8 @@ class ArchiveCompareTests(unittest.TestCase):
         self.c.execute('UPDATE archive_catalog_files SET size_bytes=10')
         self.c.execute("INSERT INTO parse_issues(source_pdf,page,issue_type,details,report_id) VALUES ('1',1,'warning','test',1)")
         s, _ = self.compare()
-        self.assertEqual(s[0]['result'], 'CONFLICT')
+        self.assertEqual(s[0]['presence_status'], 'COMPLETE')
+        self.assertEqual(s[0]['size_status'], 'VERIFIED')
         self.assertEqual(s[0]['report_parse_issues'], 1)
 
     def test_missing_folders_project_and_report(self):
@@ -82,3 +83,87 @@ class ArchiveCompareTests(unittest.TestCase):
         self.report([lto('date/a', 20, 20, tape='CXZ306')], 2)
         self.c.execute('UPDATE lto_entries SET report_id=1')
         self.assertEqual(self.compare()[1][0]['status'], 'SIZE_CONFLICT')
+
+    def test_real_vu2_date_path_and_tape_pass_without_prefix_rewriting(self):
+        directory = '20240129/CAM_A/A_0021_1D1D/A_0021_1D1D'
+        filename = 'A_0021C001_240129_181231_p1D1D.mxf'
+        self.catalog([dict(A='VU2', B='FF7472L7', C='/' + directory, D=filename)])
+        self.report([
+            lto(directory + '/' + filename, 100, 110, tape='FF7472'),
+            lto('PROXY/20240129/' + filename.replace('.mxf', '.mov'), 10, 20, tape='FF7669'),
+        ])
+        summaries, details = self.compare(['20240129'])
+        self.assertEqual(
+            [summaries[0][k] for k in ('expected_unique_files', 'found', 'missing', 'conflicts', 'unexpected')],
+            [1, 1, 0, 0, 0],
+        )
+        self.assertEqual(details[0]['status'], 'PATH_MATCH_SIZE_UNKNOWN')
+        self.assertEqual(details[0]['yoyotta_cassette'], 'FF7472')
+
+    def test_real_vu2_mojibake_path_is_not_repaired_by_filename(self):
+        filename = '20240905_174421.mp4'
+        self.catalog([dict(A='VU2', B='FF2018L7', C='/20240905/PHONE Ð—Ð°Ñ\x8fÑ†', D=filename)])
+        self.report([
+            lto('20240905/PHONE Заяц/' + filename, 100, 110, tape='FF2018'),
+            lto('20240905/PHONE ????/' + filename, 100, 110, tape='FF2018'),
+        ])
+        summaries, details = self.compare(['20240905'])
+        self.assertEqual(
+            [summaries[0][k] for k in ('expected_unique_files', 'found', 'missing', 'conflicts', 'unexpected')],
+            [1, 0, 1, 0, 2],
+        )
+        self.assertEqual(details[0]['status'], 'MISSING_ON_REPORT')
+
+    def test_presence_and_size_are_independent_of_global_diagnostics(self):
+        cases = {
+            'unknown': ([''], [10], [], 'COMPLETE', 'UNKNOWN'),
+            'partial': (['10', ''], [10, 10], [], 'COMPLETE', 'PARTIAL'),
+            'verified': (['10'], [10], [], 'COMPLETE', 'VERIFIED'),
+            'missing': (['10', '10'], [10], [], 'INCOMPLETE', 'VERIFIED'),
+            'unexpected': (['10'], [10], ['extra'], 'INCOMPLETE', 'VERIFIED'),
+            'only_unexpected': (['10'], [], ['extra'], 'INCOMPLETE', 'UNKNOWN'),
+            'absent': (['10'], [], [], 'NOT_FOUND', 'UNKNOWN'),
+            'mismatch': (['10'], [20], [], 'CONFLICT', 'CONFLICT'),
+        }
+        rows, entries = [], []
+        for folder, (sizes, observed, extras, _, _) in cases.items():
+            rows.extend(dict(A='VU2', B='FF7472L7', C=folder, D=str(i), E=size)
+                        for i, size in enumerate(sizes))
+            entries.extend(lto(f'{folder}/{i}', size, size, tape='FF7472')
+                           for i, size in enumerate(observed))
+            entries.extend(lto(f'{folder}/{name}', 10, 10, tape='FF7472') for name in extras)
+        self.catalog(rows)
+        self.report(entries)
+        before, details_before = self.compare([])
+        self.c.execute("INSERT INTO parse_issues(source_pdf,page,issue_type,details,report_id) VALUES ('1',1,'sequence_file_size_unknown','OTHER_PROJECT/path',1)")
+        self.c.execute('UPDATE report_stats SET difference=1 WHERE report_id=1')
+        after, details_after = self.compare([])
+        self.assertEqual(details_before, details_after)
+        self.assertEqual([r['presence_status'] for r in before], [r['presence_status'] for r in after])
+        for summary in after:
+            with self.subTest(folder=summary['folder']):
+                case = cases[summary['folder']]
+                self.assertEqual((summary['presence_status'], summary['size_status']), case[-2:])
+                self.assertEqual(summary['result'], summary['presence_status'])
+                self.assertEqual(summary['expected'], summary['expected_unique_files'])
+                self.assertEqual(summary['archive_project'], summary['project'])
+                self.assertEqual(summary['report_parse_issues'], 1)
+                self.assertEqual(summary['report_count_mismatches'], 1)
+                self.assertIn('global informational', summary['notes'])
+
+    def test_projects_share_database_and_unknown_project_lists_available_names(self):
+        self.catalog([
+            dict(A='VU2', B='FF7472L7', C='date', D='vu2.mxf'),
+            dict(A='KBD2', B='FF2003L7', C='date', D='kbd2.mxf', E='10'),
+        ])
+        self.report([lto('date/vu2.mxf', 10, 10, tape='FF7472'),
+                     lto('date/kbd2.mxf', 10, 10, tape='FF2003')])
+        for project, filename, size_status in [('VU2', 'vu2.mxf', 'UNKNOWN'), ('KBD2', 'kbd2.mxf', 'VERIFIED')]:
+            summary, details = a.compare_archive_project(self.c, 1, project, [])
+            self.assertEqual(summary[0]['expected'], 1)
+            self.assertEqual(summary[0]['presence_status'], 'COMPLETE')
+            self.assertEqual(summary[0]['size_status'], size_status)
+            self.assertEqual([r['filename'] for r in details], [filename])
+            self.assertEqual({r['archive_project'] for r in details}, {project})
+        with self.assertRaisesRegex(ValueError, 'No imported archive project: VU3.*Available projects: KBD2, VU2'):
+            a.compare_archive_project(self.c, 1, 'VU3', [])
